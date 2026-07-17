@@ -47,6 +47,7 @@ class VisualSettings:
     quality: str = "balanced"
     droplets: bool = True
     reduced_motion: bool = False
+    computer_control_enabled: bool = True
 
     @property
     def raymarch_steps(self) -> int:
@@ -66,6 +67,7 @@ class VisualSettings:
         # Orbital nodes are part of the core design and are always enabled.
         self.droplets = True
         self.reduced_motion = bool(self.reduced_motion)
+        self.computer_control_enabled = bool(self.computer_control_enabled)
         return self
 
 

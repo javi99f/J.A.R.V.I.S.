@@ -139,8 +139,14 @@ class VisualSettingsPanel(QFrame):
         root.addLayout(selectors)
 
         switches = QHBoxLayout()
+        self.computer_control = QCheckBox("Control del PC")
+        self.computer_control.setChecked(settings.computer_control_enabled)
+        self.computer_control.setToolTip(
+            "Permite abrir y manejar aplicaciones con límites de seguridad"
+        )
         self.reduced = QCheckBox("Reducir movimiento")
         self.reduced.setChecked(settings.reduced_motion)
+        switches.addWidget(self.computer_control)
         switches.addStretch()
         switches.addWidget(self.reduced)
         root.addLayout(switches)
@@ -150,6 +156,7 @@ class VisualSettingsPanel(QFrame):
         self.visibility.valueChanged.connect(self._publish)
         self.size.valueChanged.connect(self._publish)
         self.quality_combo.currentIndexChanged.connect(self._publish)
+        self.computer_control.toggled.connect(self._publish)
         self.reduced.toggled.connect(self._publish)
 
     @staticmethod
@@ -195,6 +202,7 @@ class VisualSettingsPanel(QFrame):
         self.settings.quality = str(self.quality_combo.currentData())
         self.settings.droplets = True
         self.settings.reduced_motion = self.reduced.isChecked()
+        self.settings.computer_control_enabled = self.computer_control.isChecked()
         self.changed.emit(self.settings.validate())
 
 
