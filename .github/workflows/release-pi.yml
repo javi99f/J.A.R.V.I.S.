@@ -25,7 +25,7 @@ jobs:
       - name: Instalar dependencias de comprobación
         run: |
           sudo apt-get update
-          sudo apt-get install -y libportaudio2 portaudio19-dev libgl1
+          sudo apt-get install -y libportaudio2 portaudio19-dev libgl1 libegl1
           python -m pip install --upgrade pip
           grep -v '^openwakeword==' requirements.txt > .requirements-ci.txt
           python -m pip install -r .requirements-ci.txt
@@ -45,26 +45,31 @@ jobs:
         run: python tools/build_pi_release.py --output dist-release --notes-file CHANGELOG.md
 
       - name: Publicar o completar GitHub Release
-        if: github.ref_type == 'tag'
+        if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" \
+          VERSION="$(tr -d '\r\n' < VERSION)"
+          RELEASE_TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            RELEASE_TAG="v${VERSION}"
+          fi
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" \
               dist-release/jarvis-pi-arm64.zip \
               dist-release/jarvis-pi-manifest.json \
               --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" \
+            gh release create "${RELEASE_TAG}" \
               dist-release/jarvis-pi-arm64.zip \
               dist-release/jarvis-pi-manifest.json \
-              --title "Jarvis ${GITHUB_REF_NAME}" \
+              --title "Jarvis ${RELEASE_TAG}" \
               --notes-file CHANGELOG.md
           fi
 
       - name: Guardar paquete de prueba manual
-        if: github.ref_type != 'tag'
+        if: github.ref_type != 'tag' && github.event_name != 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: jarvis-pi-arm64
