@@ -20,11 +20,17 @@ class VisualSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "visual.json"
             save_visual_settings(
-                VisualSettings(assistant_size=128, visibility=0.42), path
+                VisualSettings(
+                    assistant_size=128,
+                    visibility=0.42,
+                    computer_control_enabled=False,
+                ),
+                path,
             )
             loaded = load_visual_settings(path)
             self.assertEqual(loaded.assistant_size, 128)
             self.assertAlmostEqual(loaded.visibility, 0.42)
+            self.assertFalse(loaded.computer_control_enabled)
 
 
 if __name__ == "__main__":
