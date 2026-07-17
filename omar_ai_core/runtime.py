@@ -21,6 +21,7 @@ from .memory.store import (
 from .tools.web_lookup import web_search as web_search_action
 from .tools.pi_device import pi_controls
 from .tools.home_control import home_control
+from .tools.computer_control import capture_screen_jpeg, computer_control
 from .settings import BASE_DIR, get_secret, is_desktop_mode, require_secret
 from .state import listening as listening_state
 from .audio.wakeword import WakeWordGate
@@ -281,6 +282,54 @@ TOOL_DECLARATIONS = [
         },
     },
     {
+        "name": "computer_control",
+        "description": (
+            "Controls the local Windows desktop in constrained safety mode. Use observe before clicking "
+            "and after any screen change; never guess coordinates. It can list/open safe installed apps, "
+            "inspect the active window, click, move, drag, scroll, type, press keys, use safe hotkeys, and wait. "
+            "It cannot use terminals, PowerShell, the registry, Windows settings, installers, or arbitrary paths. "
+            "Set sensitive=true for anything that sends/publishes content, purchases, deletes data, changes an "
+            "account, closes unsaved work, uploads/shares a file, or could otherwise have an external consequence. "
+            "Sensitive actions require explicit user approval and a local Windows confirmation dialog."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "observe | list_apps | open_app | active_window | click | double_click | right_click | "
+                        "move | drag | scroll | type_text | press_key | hotkey | wait"
+                    ),
+                },
+                "app": {"type": "STRING", "description": "Installed application display name for open_app."},
+                "x": {"type": "INTEGER", "description": "X coordinate in the most recent observed screenshot."},
+                "y": {"type": "INTEGER", "description": "Y coordinate in the most recent observed screenshot."},
+                "end_x": {"type": "INTEGER", "description": "Drag destination X coordinate."},
+                "end_y": {"type": "INTEGER", "description": "Drag destination Y coordinate."},
+                "amount": {"type": "INTEGER", "description": "Scroll steps, positive up and negative down."},
+                "text": {"type": "STRING", "description": "Text to type into the active application."},
+                "key": {"type": "STRING", "description": "Single key name for press_key."},
+                "keys": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Key names for hotkey, e.g. [ctrl, l].",
+                },
+                "presses": {"type": "INTEGER", "description": "Number of key presses, maximum 20."},
+                "seconds": {"type": "NUMBER", "description": "Wait duration, maximum five seconds."},
+                "sensitive": {
+                    "type": "BOOLEAN",
+                    "description": "True for any consequential action that requires local confirmation.",
+                },
+                "confirmed": {
+                    "type": "BOOLEAN",
+                    "description": "True only after the user explicitly approved this exact sensitive action.",
+                },
+            },
+            "required": ["action"],
+        },
+    },
+    {
         "name": "shutdown_jarvis",
         "description": "Shuts down the assistant when the user clearly asks to stop, quit, close, or end JARVIS.",
         "parameters": {"type": "OBJECT", "properties": {}},
@@ -305,7 +354,7 @@ def _available_tool_declarations() -> list[dict]:
     if is_desktop_mode():
         disabled = {"pi_controls", "social_insights", "jarvis_update"}
         return [item for item in TOOL_DECLARATIONS if item.get("name") not in disabled]
-    return TOOL_DECLARATIONS
+    return [item for item in TOOL_DECLARATIONS if item.get("name") != "computer_control"]
 
 
 class JarvisLive:
@@ -522,9 +571,14 @@ class JarvisLive:
         if is_desktop_mode():
             parts.append(
                 "[DESKTOP SAFETY MODE]\n"
-                "You may use the microphone for conversation, but you have no computer-control, "
-                "camera, file-management, keyboard, mouse, application-launching, or operating-system tools. "
-                "Never claim to perform those actions."
+                "You may control ordinary Windows applications with computer_control. Always observe the screen "
+                "before clicking and observe again after navigation or a visual change. Never invent coordinates "
+                "or claim success without visual/tool evidence. Never try to open or control PowerShell, CMD, "
+                "Terminal, Registry Editor, Control Panel, Windows Settings, installers, system administration, "
+                "or arbitrary executable/file paths. Mark any consequential action as sensitive and ask for explicit "
+                "approval before retrying it with confirmed=true; the user must also approve the native dialog. "
+                "Examples include sending or publishing, purchases, deleting, account changes, uploads/shares, "
+                "and closing unsaved work. Stop if the screen is ambiguous."
             )
         if mem_str:
             parts.append(mem_str)
@@ -624,6 +678,31 @@ class JarvisLive:
             elif name == "home_control":
                 r = await loop.run_in_executor(None, lambda: home_control(parameters=args, player=self.ui))
                 result = r or "Done."
+
+            elif name == "computer_control":
+                if not is_desktop_mode():
+                    result = "Computer control is available only in the Windows desktop edition."
+                    return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
+                from .display.visual_config import load_visual_settings
+
+                if not load_visual_settings().computer_control_enabled:
+                    result = "Computer control is disabled in Jarvis visual settings."
+                elif action == "observe":
+                    frame = await loop.run_in_executor(None, capture_screen_jpeg)
+                    await self.session.send_realtime_input(
+                        video=types.Blob(data=frame.jpeg, mime_type="image/jpeg")
+                    )
+                    result = {
+                        "status": "Current desktop screenshot sent for visual inspection.",
+                        "screenshot_size": [frame.width, frame.height],
+                        "coordinate_origin": [frame.origin_x, frame.origin_y],
+                        "active_window": frame.active_title,
+                        "active_process": frame.active_process,
+                    }
+                else:
+                    result = await loop.run_in_executor(
+                        None, lambda: computer_control(parameters=args, player=self.ui)
+                    )
 
             elif name == "jarvis_update":
                 if is_desktop_mode():
