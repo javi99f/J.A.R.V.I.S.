@@ -7,5 +7,6 @@ requests>=2.31,<3
 ddgs>=9,<10
 psutil>=5.9,<8
 Pillow>=10,<13
+PyAutoGUI>=0.9.54,<1
 numpy>=1.26,<3
 openwakeword==0.6.0
