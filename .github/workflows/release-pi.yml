@@ -44,16 +44,24 @@ jobs:
       - name: Construir paquete verificado por SHA-256
         run: python tools/build_pi_release.py --output dist-release --notes-file CHANGELOG.md
 
-      - name: Publicar GitHub Release
+      - name: Publicar o completar GitHub Release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist-release/jarvis-pi-arm64.zip \
-            dist-release/jarvis-pi-manifest.json \
-            --title "Jarvis ${GITHUB_REF_NAME}" \
-            --notes-file CHANGELOG.md
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" \
+              dist-release/jarvis-pi-arm64.zip \
+              dist-release/jarvis-pi-manifest.json \
+              --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              dist-release/jarvis-pi-arm64.zip \
+              dist-release/jarvis-pi-manifest.json \
+              --title "Jarvis ${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG.md
+          fi
 
       - name: Guardar paquete de prueba manual
         if: github.ref_type != 'tag'
