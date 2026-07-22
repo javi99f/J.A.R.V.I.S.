@@ -29,7 +29,9 @@ jobs:
           python -m pip install --upgrade pip
           grep -v '^openwakeword==' requirements.txt > .requirements-ci.txt
           python -m pip install -r .requirements-ci.txt
+          python -m pip install 'tqdm>=4,<5' 'scipy>=1.3,<2' 'scikit-learn>=1,<2'
           python -m pip install --no-deps openwakeword==0.6.0
+          python -c "from openwakeword.utils import download_models; download_models(['hey_jarvis'])"
 
       - name: Comprobar versión y pruebas
         shell: bash
