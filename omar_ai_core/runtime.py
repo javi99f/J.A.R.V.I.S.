@@ -10,13 +10,19 @@ import traceback
 from collections import deque
 from pathlib import Path
 
+import numpy as np
 import sounddevice as sd
 from google import genai
 from google.genai import types
 from .display.hud import JarvisUI
 from .memory.store import (
-    load_memory, update_memory, format_memory_for_prompt,
+    forget_memory,
+    format_memory_for_prompt,
+    load_memory,
+    remember,
+    search_memories,
 )
+from .planning import PlanManager, format_plan_for_prompt, is_complex_request
 
 from .tools.web_lookup import web_search as web_search_action
 from .tools.pi_device import pi_controls
@@ -55,10 +61,151 @@ LISTENING_MUTE_ACTIONS = {"listening_mute", "assistant_mute", "mute_listening", 
 LISTENING_UNMUTE_ACTIONS = {"listening_unmute", "assistant_unmute", "unmute_listening", "start_listening"}
 SPEAKER_MUTE_ACTIONS = {"speaker_mute", "mute_speaker", "volume_mute"}
 SPEAKER_UNMUTE_ACTIONS = {"speaker_unmute", "unmute_speaker", "volume_unmute"}
+TRANSIENT_LIVE_MARKERS = (
+    "operation was aborted",
+    "connection closed",
+    "connectionclosed",
+    "keepalive ping timeout",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "network is unreachable",
+    "temporary failure",
+    "service unavailable",
+    "try again",
+)
 
 
 def _get_api_key() -> str:
     return require_secret("GEMINI_API_KEY")
+
+
+def _exception_leaves(error: BaseException) -> list[BaseException]:
+    children = getattr(error, "exceptions", None)
+    if children:
+        leaves = []
+        for child in children:
+            leaves.extend(_exception_leaves(child))
+        return leaves
+    return [error]
+
+
+def _live_error_summary(error: BaseException) -> str:
+    summaries = []
+    for leaf in _exception_leaves(error):
+        text = " ".join(str(leaf).strip().split()) or type(leaf).__name__
+        summary = f"{type(leaf).__name__}: {text[:180]}"
+        if summary not in summaries:
+            summaries.append(summary)
+    return "; ".join(summaries[:3]) or type(error).__name__
+
+
+def _is_transient_live_error(error: BaseException) -> bool:
+    for leaf in _exception_leaves(error):
+        if isinstance(leaf, (TimeoutError, ConnectionError, OSError, asyncio.TimeoutError)):
+            continue
+        module = type(leaf).__module__.casefold()
+        name = type(leaf).__name__.casefold()
+        text = str(leaf).casefold()
+        if module.startswith("websockets") and "connectionclosed" in name:
+            continue
+        if module.startswith("google.genai") and name == "apierror":
+            code = getattr(leaf, "code", None)
+            if code in {408, 429, 500, 502, 503, 504, 1001, 1006, 1008, 1011}:
+                continue
+        if any(marker in text for marker in TRANSIENT_LIVE_MARKERS):
+            continue
+        return False
+    return True
+
+
+def _configured_audio_device(name: str) -> int | None:
+    value = get_secret(name)
+    try:
+        selected = int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+    if selected is None:
+        return None
+    direction = "input" if name == "INPUT_DEVICE" else "output"
+    saved_label = get_secret(f"{name}_NAME")
+    if not saved_label:
+        return selected
+    try:
+        # Import lazily because liquid_window is part of the desktop UI module
+        # loaded by hud while this runtime module is being initialized.
+        from .display.liquid_window import _canonical_audio_device, enumerate_audio_devices
+
+        devices = sd.query_devices()
+        candidates = enumerate_audio_devices(direction, devices, sd.query_hostapis())
+        return _canonical_audio_device(selected, devices, candidates, saved_label)
+    except Exception:
+        # PortAudio can be temporarily unavailable while Windows is changing
+        # endpoints.  The live refresh path will retry after the UI starts.
+        return selected
+
+
+def _audio_stream_format(
+    device: int | None,
+    direction: str,
+    target_rate: int,
+) -> tuple[int, int]:
+    """Choose a format the selected Windows endpoint actually accepts."""
+    info = sd.query_devices(device, direction)
+    channel_key = "max_input_channels" if direction == "input" else "max_output_channels"
+    max_channels = max(1, int(info[channel_key]))
+    default_rate = int(round(float(info.get("default_samplerate") or target_rate)))
+    rates = list(dict.fromkeys((default_rate, target_rate, 48000, 44100)))
+    channels = list(dict.fromkeys((1, min(2, max_channels), max_channels)))
+    checker = sd.check_input_settings if direction == "input" else sd.check_output_settings
+    last_error: Exception | None = None
+    for rate in rates:
+        for channel_count in channels:
+            try:
+                checker(
+                    device=device,
+                    channels=channel_count,
+                    dtype="int16",
+                    samplerate=rate,
+                )
+                return rate, channel_count
+            except Exception as exc:
+                last_error = exc
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"No compatible {direction} audio format")
+
+
+def _convert_pcm16(
+    data: bytes,
+    source_rate: int,
+    target_rate: int,
+    source_channels: int = 1,
+    target_channels: int = 1,
+) -> bytes:
+    """Convert streaming PCM to the rate/channel layout required by an endpoint."""
+    samples = np.frombuffer(data, dtype="<i2")
+    if samples.size == 0:
+        return b""
+    source_channels = max(1, int(source_channels))
+    usable = samples.size - (samples.size % source_channels)
+    if usable <= 0:
+        return b""
+    mono = samples[:usable].reshape(-1, source_channels).astype(np.float32).mean(axis=1)
+    if source_rate != target_rate and mono.size > 1:
+        target_length = max(1, int(round(mono.size * target_rate / source_rate)))
+        positions = np.arange(target_length, dtype=np.float32) * (source_rate / target_rate)
+        mono = np.interp(positions, np.arange(mono.size, dtype=np.float32), mono)
+    converted = np.clip(np.rint(mono), -32768, 32767).astype("<i2")
+    if target_channels > 1:
+        converted = np.repeat(converted[:, None], target_channels, axis=1).reshape(-1)
+    return converted.tobytes()
+
+
+def _restart_portaudio_backend() -> None:
+    sd._terminate()
+    sd._initialize()
 
 
 def _configure_live_transport() -> None:
@@ -164,6 +311,16 @@ def _load_system_prompt() -> str:
 
 def _normalized_action(args: dict) -> str:
     return str(args.get("action") or "").lower().strip().replace("-", "_").replace(" ", "_")
+
+
+def _configured_thinking_level() -> types.ThinkingLevel:
+    configured = get_secret("THINKING_LEVEL", "MEDIUM").strip().upper()
+    return {
+        "MINIMAL": types.ThinkingLevel.MINIMAL,
+        "LOW": types.ThinkingLevel.LOW,
+        "MEDIUM": types.ThinkingLevel.MEDIUM,
+        "HIGH": types.ThinkingLevel.HIGH,
+    }.get(configured, types.ThinkingLevel.MEDIUM)
 
 
 def _is_wake_phrase(text: str) -> bool:
@@ -285,8 +442,14 @@ TOOL_DECLARATIONS = [
         "name": "computer_control",
         "description": (
             "Controls the local Windows desktop in constrained safety mode. Use observe before clicking "
-            "and after any screen change; never guess coordinates. It can list/open safe installed apps, "
-            "inspect the active window, click, move, drag, scroll, type, press keys, use safe hotkeys, and wait. "
+            "and after any screen change; never guess coordinates. It opens searches and URLs in the Windows "
+            "default browser, can list/open safe installed apps, inspect "
+            "the active application's semantic controls, activate a control by ref, type into a named field, "
+            "inspect the active window, click, move, drag, scroll, press keys, use safe hotkeys, and wait. For "
+            "multi-step work inside an application, open it, wait, call inspect_ui, choose controls by their names "
+            "and refs, use click_control or type_into_control, then inspect again after every navigation or state "
+            "change. Prefer semantic controls over coordinates. Use observe and coordinate actions only when the "
+            "needed control is not exposed through inspect_ui. Continue until the requested end state is verified. "
             "It cannot use terminals, PowerShell, the registry, Windows settings, installers, or arbitrary paths. "
             "Set sensitive=true for anything that sends/publishes content, purchases, deletes data, changes an "
             "account, closes unsaved work, uploads/shares a file, or could otherwise have an external consequence. "
@@ -298,17 +461,42 @@ TOOL_DECLARATIONS = [
                 "action": {
                     "type": "STRING",
                     "description": (
-                        "observe | list_apps | open_app | active_window | click | double_click | right_click | "
-                        "move | drag | scroll | type_text | press_key | hotkey | wait"
+                        "observe | browser_search | open_url | inspect_ui | find_ui | click_named | "
+                        "click_control | type_into_control | list_apps | open_app | active_window | click | "
+                        "double_click | right_click | move | drag | scroll | type_text | press_key | hotkey | wait"
                     ),
                 },
                 "app": {"type": "STRING", "description": "Installed application display name for open_app."},
+                "query": {
+                    "type": "STRING",
+                    "description": "Search terms for browser_search, find_ui, or click_named.",
+                },
+                "url": {
+                    "type": "STRING",
+                    "description": "Complete http/https URL for open_url.",
+                },
+                "ref": {
+                    "type": "STRING",
+                    "description": "Control ref returned by the latest inspect_ui call, e.g. ui4.",
+                },
+                "limit": {
+                    "type": "INTEGER",
+                    "description": "Maximum controls/apps to return, from 10 to 120.",
+                },
                 "x": {"type": "INTEGER", "description": "X coordinate in the most recent observed screenshot."},
                 "y": {"type": "INTEGER", "description": "Y coordinate in the most recent observed screenshot."},
                 "end_x": {"type": "INTEGER", "description": "Drag destination X coordinate."},
                 "end_y": {"type": "INTEGER", "description": "Drag destination Y coordinate."},
                 "amount": {"type": "INTEGER", "description": "Scroll steps, positive up and negative down."},
                 "text": {"type": "STRING", "description": "Text to type into the active application."},
+                "replace": {
+                    "type": "BOOLEAN",
+                    "description": "For type_into_control, replace the current field value; defaults to true.",
+                },
+                "submit": {
+                    "type": "BOOLEAN",
+                    "description": "For type_into_control, press Enter after typing.",
+                },
                 "key": {"type": "STRING", "description": "Single key name for press_key."},
                 "keys": {
                     "type": "ARRAY",
@@ -336,15 +524,70 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "save_memory",
-        "description": "Silently saves durable user facts, preferences, projects, goals, and notes to memory.",
+        "description": (
+            "Silently saves a durable, non-sensitive user fact, preference, project, goal, relationship, or note. "
+            "Never save passwords, API keys, authentication tokens, payment details, or one-time commands."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "category": {"type": "STRING", "description": "identity | preferences | projects | relationships | wishes | notes"},
                 "key": {"type": "STRING", "description": "Short snake_case key."},
                 "value": {"type": "STRING", "description": "Concise value in English."},
+                "importance": {"type": "NUMBER", "description": "Long-term relevance from 0.0 to 1.0."},
             },
             "required": ["category", "key", "value"],
+        },
+    },
+    {
+        "name": "recall_memory",
+        "description": (
+            "Retrieves relevant long-term memories when the user refers to previous preferences, projects, "
+            "people, goals, or facts that are not already present in the current context."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "query": {"type": "STRING", "description": "What should be recalled."},
+                "limit": {"type": "INTEGER", "description": "Maximum memories to return, from 1 to 12."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "forget_memory",
+        "description": "Deletes one stored memory only when the user explicitly asks JARVIS to forget it.",
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "category": {"type": "STRING", "description": "Memory category."},
+                "key": {"type": "STRING", "description": "Exact memory key to delete."},
+            },
+            "required": ["category", "key"],
+        },
+    },
+    {
+        "name": "task_plan",
+        "description": (
+            "Creates and maintains a checkable plan for genuinely complex multi-step tasks. Start before the first "
+            "action, mark one step in_progress at a time, mark it completed only after verification, and complete "
+            "the plan only when all requested work is verified. Do not use for simple questions or one-step commands."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "start | update | status | complete | cancel | blocked"},
+                "goal": {"type": "STRING", "description": "The user's requested outcome."},
+                "steps": {
+                    "type": "ARRAY",
+                    "items": {"type": "STRING"},
+                    "description": "Two to twelve concrete, verifiable steps for start.",
+                },
+                "step": {"type": "INTEGER", "description": "One-based step number for update."},
+                "status": {"type": "STRING", "description": "pending | in_progress | completed | blocked"},
+                "note": {"type": "STRING", "description": "Short evidence, result, or blocking reason."},
+            },
+            "required": ["action"],
         },
     },
 ]
@@ -371,10 +614,22 @@ class JarvisLive:
         self._state_mtime   = 0.0
         self._last_state_check = 0.0
         self._pre_roll = deque(maxlen=12)
+        self.plans = PlanManager()
         self.updates = UpdateManager()
         self._pending_update: ReleaseInfo | None = None
         self._restart_requested = False
         self._restart_fallback_started = False
+        self._microphone_available: bool | None = None
+        self._speaker_available: bool | None = None
+        self._input_device = _configured_audio_device("INPUT_DEVICE")
+        self._output_device = _configured_audio_device("OUTPUT_DEVICE")
+        self._input_device_generation = 0
+        self._output_device_generation = 0
+        self._input_stream_open = False
+        self._output_stream_open = False
+        self._audio_backend_refreshing = False
+        self._audio_backend_refresh_pending = False
+        self._audio_backend_refresh_task = None
         self.wake_gate = WakeWordGate(
             mode=get_secret("WAKE_MODE", "wakeword").lower(),
             threshold=float(get_secret("WAKE_THRESHOLD", "0.55")),
@@ -383,12 +638,84 @@ class JarvisLive:
         )
         self.ui.on_text_command = self._on_text_command
         self.ui.on_manual_activate = self._manual_activate
+        if is_desktop_mode() and hasattr(self.ui, "on_audio_devices_changed"):
+            self.ui.on_audio_devices_changed = self._on_audio_devices_changed
+        if is_desktop_mode() and hasattr(self.ui, "on_audio_refresh_requested"):
+            self.ui.on_audio_refresh_requested = self._on_audio_refresh_requested
         self.ui.muted = listening_state.get_listening_muted(False)
         if self.wake_gate.mode == "wakeword" and not self.wake_gate.available:
             self.ui.write_log(f"ERR: Local wake word unavailable: {self.wake_gate.error}")
             self.ui.write_log("SYS: Privacy fallback active; use typed commands until it is repaired.")
         elif self.wake_gate.error:
             self.ui.write_log(f"WARN: {self.wake_gate.error}")
+
+    def _on_audio_devices_changed(self, input_device, output_device) -> None:
+        try:
+            input_device = int(input_device) if input_device is not None else None
+        except (TypeError, ValueError):
+            input_device = None
+        try:
+            output_device = int(output_device) if output_device is not None else None
+        except (TypeError, ValueError):
+            output_device = None
+
+        if input_device != self._input_device:
+            self._input_device = input_device
+            self._input_device_generation += 1
+            self.ui.write_log("SYS: Dispositivo de entrada actualizado.")
+
+        if output_device != self._output_device:
+            self._output_device = output_device
+            self._output_device_generation += 1
+            self.ui.write_log("SYS: Dispositivo de salida actualizado.")
+            if self._loop is not None and self.audio_in_queue is not None:
+                self._loop.call_soon_threadsafe(self._request_output_stream_restart)
+
+    def _request_output_stream_restart(self) -> None:
+        if self.audio_in_queue is None:
+            return
+        while not self.audio_in_queue.empty():
+            try:
+                self.audio_in_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self.audio_in_queue.put_nowait(None)
+
+    def _on_audio_refresh_requested(self) -> None:
+        self._audio_backend_refresh_pending = True
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._schedule_audio_backend_refresh)
+
+    def _schedule_audio_backend_refresh(self) -> None:
+        if self._audio_backend_refresh_task and not self._audio_backend_refresh_task.done():
+            return
+        self._audio_backend_refresh_task = asyncio.create_task(
+            self._refresh_audio_backend()
+        )
+
+    async def _refresh_audio_backend(self) -> None:
+        self._audio_backend_refreshing = True
+        self._input_device_generation += 1
+        self._output_device_generation += 1
+        self._request_output_stream_restart()
+        deadline = time.monotonic() + 2.0
+        while (
+            self._input_stream_open or self._output_stream_open
+        ) and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        try:
+            if self._input_stream_open or self._output_stream_open:
+                raise RuntimeError("audio streams did not close before refresh")
+            await asyncio.to_thread(_restart_portaudio_backend)
+            self._audio_backend_refresh_pending = False
+            refresh_ui = getattr(self.ui, "refresh_audio_devices", None)
+            if refresh_ui is not None:
+                refresh_ui()
+            self.ui.write_log("SYS: Lista de dispositivos de audio actualizada.")
+        except Exception as exc:
+            self.ui.write_log(f"ERR: No se pudo actualizar el audio: {exc}")
+        finally:
+            self._audio_backend_refreshing = False
 
     def _manual_activate(self):
         if self.ui.muted:
@@ -418,13 +745,32 @@ class JarvisLive:
             self.ui.write_log("SYS: Listening muted by control file." if muted else "SYS: Listening resumed by control file.")
 
     def _on_text_command(self, text: str):
+        text = str(text or "").strip()
+        if not text:
+            return
+        self.ui.write_log(f"You: {text}")
         if not self._loop or not self.session:
             self.ui.write_log("ERR: Gemini no esta conectado. Reintentando la conexion...")
             self.ui.set_state("STANDBY")
             return
         self.ui.set_state("THINKING")
+        relevant_memory = format_memory_for_prompt(query=text, limit=8)
+        active_plan = getattr(self, "plans", PlanManager()).load()
+        plan_context = format_plan_for_prompt(active_plan)
+        planning_instruction = ""
+        if is_complex_request(text) and not plan_context:
+            self.ui.write_log("SYS: Tarea compleja detectada; preparando un plan verificable.")
+            planning_instruction = (
+                "[INTERNAL COMPLEX-TASK INSTRUCTION]\n"
+                "Before taking the first action, call task_plan with action=start and 2-12 concrete steps. "
+                "Update each step as work progresses. Do not declare success until every step is verified.\n"
+            )
+        payload = (
+            f"{planning_instruction}{plan_context}{relevant_memory}"
+            f"[USER REQUEST]\n{text}"
+        )
         future = asyncio.run_coroutine_threadsafe(
-            self.session.send_realtime_input(text=text), self._loop
+            self.session.send_realtime_input(text=payload), self._loop
         )
         future.add_done_callback(self._text_send_finished)
 
@@ -498,7 +844,7 @@ class JarvisLive:
 
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â {short}")
+        self.ui.write_log(f"ERR: {tool_name} - {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
     def _queue_mic_chunk(self, data: bytes):
@@ -557,10 +903,11 @@ class JarvisLive:
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
+        plan_str   = format_plan_for_prompt(getattr(self, "plans", PlanManager()).load())
         sys_prompt = _load_system_prompt()
 
         now      = datetime.now()
-        time_str = now.strftime("%A, %B %d, %Y ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â %I:%M %p")
+        time_str = now.strftime("%A, %B %d, %Y - %I:%M %p")
         time_ctx = (
             f"[CURRENT DATE & TIME]\n"
             f"Right now it is: {time_str}\n"
@@ -573,7 +920,21 @@ class JarvisLive:
                 "[DESKTOP SAFETY MODE]\n"
                 "You may control ordinary Windows applications with computer_control. Always observe the screen "
                 "before clicking and observe again after navigation or a visual change. Never invent coordinates "
-                "or claim success without visual/tool evidence. Never try to open or control PowerShell, CMD, "
+                "or claim success without visual/tool evidence. For multi-step work inside any application, keep "
+                "working after open_app: wait for it, call inspect_ui, identify controls by name and ref, use "
+                "click_control or type_into_control, and inspect again after each state change until the requested "
+                "result is verified. Use find_ui when the active application or web page has too many controls, "
+                "and click_named only when its match is unambiguous. Requests to search, open, show, watch, or play "
+                "something on the computer are interaction tasks: use browser_search or open_url so they open in "
+                "the Windows default browser; do not use factual web_search as a substitute. After browser_search, "
+                "wait for the page, find and activate the relevant result, then keep inspecting and interacting. "
+                "For requested media playback, success means playback is actually active, not merely that search "
+                "results or a media page are visible. Activate the page's named play control and verify that it "
+                "changed to pause/playing; if the player exposes no semantic control, observe it and use a verified "
+                "coordinate click or the focused player's safe play/pause key, then observe again. "
+                "Prefer these semantic controls over coordinates. Fall back to observe and "
+                "coordinate actions only for controls that the application does not expose. Never try to open or "
+                "control PowerShell, CMD, "
                 "Terminal, Registry Editor, Control Panel, Windows Settings, installers, system administration, "
                 "or arbitrary executable/file paths. Mark any consequential action as sensitive and ask for explicit "
                 "approval before retrying it with confirmed=true; the user must also approve the native dialog. "
@@ -582,6 +943,8 @@ class JarvisLive:
             )
         if mem_str:
             parts.append(mem_str)
+        if plan_str:
+            parts.append(plan_str)
         parts.append(sys_prompt)
 
         return types.LiveConnectConfig(
@@ -590,7 +953,7 @@ class JarvisLive:
             input_audio_transcription={},
             thinking_config=types.ThinkingConfig(
                 include_thoughts=False,
-                thinking_level=types.ThinkingLevel.MINIMAL,
+                thinking_level=_configured_thinking_level(),
             ),
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": _available_tool_declarations()}],
@@ -608,7 +971,7 @@ class JarvisLive:
         name = fc.name
         args = dict(fc.args or {})
 
-        print(f"[JARVIS] ?? {name}  {args}")
+        print(f"[JARVIS] Tool request: {name} {args}")
         action = _normalized_action(args)
         if self.ui.muted:
             print(f"[JARVIS] muted: ignored tool {name}/{action}")
@@ -622,15 +985,70 @@ class JarvisLive:
             category = args.get("category", "notes")
             key = args.get("key", "")
             value = args.get("value", "")
-            if key and value:
-                update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] ?? save_memory: {category}/{key} = {value}")
+            importance = args.get("importance", 0.5)
+            result = remember(key, value, category, importance) if key and value else "Memory requires a key and value."
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
                 id=fc.id, name=name,
-                response={"result": "ok", "silent": True}
+                response={"result": result, "silent": True}
             )
+
+        if name == "recall_memory":
+            query = str(args.get("query") or "").strip()
+            limit = min(12, max(1, int(args.get("limit") or 8)))
+            matches = search_memories(query, limit=limit) if query else []
+            result = [
+                {
+                    "category": item["category"],
+                    "key": item["key"],
+                    "value": item["value"],
+                    "updated_at": item["updated_at"],
+                }
+                for item in matches
+            ]
+            return types.FunctionResponse(
+                id=fc.id,
+                name=name,
+                response={"result": result or "No relevant memory was found."},
+            )
+
+        if name == "forget_memory":
+            result = forget_memory(args.get("key", ""), args.get("category", "notes"))
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
+
+        if name == "task_plan":
+            manager = getattr(self, "plans", None)
+            if manager is None:
+                manager = self.plans = PlanManager()
+            try:
+                if action == "start":
+                    plan = manager.start(args.get("goal", ""), args.get("steps") or [])
+                    self.ui.write_log(f"PLAN: {plan['goal']}")
+                elif action == "update":
+                    plan = manager.update(
+                        args.get("step"), args.get("status", "in_progress"), args.get("note", "")
+                    )
+                    current = plan["steps"][int(args.get("step")) - 1]
+                    self.ui.write_log(
+                        f"PLAN: Paso {current['index']} {current['status']}: {current['text']}"
+                    )
+                elif action == "status":
+                    plan = manager.load()
+                elif action in {"complete", "cancel", "blocked"}:
+                    final_status = {
+                        "complete": "completed",
+                        "cancel": "cancelled",
+                        "blocked": "blocked",
+                    }[action]
+                    plan = manager.finish(final_status, args.get("note", ""))
+                    self.ui.write_log(f"PLAN: {plan['status']}: {plan['goal']}")
+                else:
+                    raise ValueError("Unknown plan action.")
+                result = plan or "There is no active plan."
+            except (TypeError, ValueError) as exc:
+                result = f"Plan update rejected: {exc}"
+            return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
 
         loop = asyncio.get_event_loop()
         result = "Done."
@@ -776,7 +1194,7 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] ?? {name} ? {str(result)[:80]}")
+        print(f"[JARVIS] Tool result: {name} - {str(result)[:80]}")
 
         return types.FunctionResponse(
             id=fc.id, name=name,
@@ -789,14 +1207,27 @@ class JarvisLive:
             await self.session.send_realtime_input(audio=msg)
 
     async def _listen_audio(self):
-        print("[JARVIS] ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¤ Mic started")
+        print("[JARVIS] Mic started")
         loop = asyncio.get_event_loop()
+        generation = self._input_device_generation
+        device = self._input_device
+        stream_rate, stream_channels = _audio_stream_format(
+            device, "input", SEND_SAMPLE_RATE
+        )
 
         def callback(indata, frames, time_info, status):
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
             if not jarvis_speaking:
-                data = indata.tobytes()
+                data = _convert_pcm16(
+                    indata.tobytes(),
+                    stream_rate,
+                    SEND_SAMPLE_RATE,
+                    stream_channels,
+                    CHANNELS,
+                )
+                if not data:
+                    return
                 # Reuse the recognition PCM for visual analysis.  The UI does
                 # not open a second microphone stream or compete for access.
                 feed_visual = getattr(self.ui, "feed_input_audio", None)
@@ -809,23 +1240,29 @@ class JarvisLive:
 
         try:
             with sd.InputStream(
-                device=int(get_secret("INPUT_DEVICE")) if get_secret("INPUT_DEVICE") else None,
-                samplerate=SEND_SAMPLE_RATE,
-                channels=CHANNELS,
+                device=device,
+                samplerate=stream_rate,
+                channels=stream_channels,
                 dtype="int16",
-                blocksize=CHUNK_SIZE,
+                blocksize=max(256, int(round(CHUNK_SIZE * stream_rate / SEND_SAMPLE_RATE))),
                 callback=callback,
             ):
-                print("[JARVIS] ÃƒÂ°Ã…Â¸Ã…Â½Ã‚Â¤ Mic stream open")
+                print("[JARVIS] Mic stream open")
+                self._input_stream_open = True
                 while True:
+                    if generation != self._input_device_generation:
+                        return
+                    self._microphone_available = True
                     self._sync_external_listening_state()
                     await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"[JARVIS] ÃƒÂ¢Ã‚ÂÃ…â€™ Mic: {e}")
+            print(f"[JARVIS] Mic error: {e}")
             raise
+        finally:
+            self._input_stream_open = False
 
     async def _receive_audio(self):
-        print("[JARVIS] ÃƒÂ°Ã…Â¸Ã¢â‚¬ËœÃ¢â‚¬Å¡ Recv started")
+        print("[JARVIS] Receive started")
         out_buf, in_buf = [], []
 
         try:
@@ -880,7 +1317,7 @@ class JarvisLive:
                     if response.tool_call:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] ÃƒÂ°Ã…Â¸Ã¢â‚¬Å“Ã…Â¾ {fc.name}")
+                            print(f"[JARVIS] Tool call: {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
@@ -888,26 +1325,63 @@ class JarvisLive:
                         )
 
         except Exception as e:
-            print(f"[JARVIS] ÃƒÂ¢Ã‚ÂÃ…â€™ Recv: {e}")
-            traceback.print_exc()
+            print(f"[JARVIS] Receive channel closed: {_live_error_summary(e)}")
+            if not _is_transient_live_error(e):
+                traceback.print_exc()
             raise
 
+    async def _listen_audio_resilient(self):
+        """Keep Gemini's text channel alive when audio input is unavailable."""
+        while True:
+            if getattr(self, "_audio_backend_refreshing", False):
+                await asyncio.sleep(0.05)
+                continue
+            try:
+                await self._listen_audio()
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                first_failure = self._microphone_available is not False
+                self._microphone_available = False
+                print(f"[JARVIS] Microphone unavailable; text mode active: {exc}")
+                if first_failure:
+                    self.ui.write_log(
+                        "WARN: Microphone unavailable. Text commands remain active; "
+                        "connect or configure INPUT_DEVICE to restore voice input."
+                    )
+                # Retry quietly so hot-plugging a microphone restores voice
+                # without restarting Jarvis, but never disconnect Gemini.
+                await asyncio.sleep(5.0)
+
     async def _play_audio(self):
-        print("[JARVIS] ?? Play started")
+        print("[JARVIS] Playback started")
         loop = asyncio.get_event_loop()
+        generation = self._output_device_generation
+        device = self._output_device
+        stream_rate, stream_channels = _audio_stream_format(
+            device, "output", RECEIVE_SAMPLE_RATE
+        )
 
         stream = sd.RawOutputStream(
-            device=int(get_secret("OUTPUT_DEVICE")) if get_secret("OUTPUT_DEVICE") else None,
-            samplerate=RECEIVE_SAMPLE_RATE,
-            channels=CHANNELS,
+            device=device,
+            samplerate=stream_rate,
+            channels=stream_channels,
             dtype="int16",
             blocksize=CHUNK_SIZE,
         )
-        stream.start()
-        print(f"[JARVIS] Audio output ready: {sd.query_devices(stream.device)['name']}")
         try:
+            stream.start()
+            self._output_stream_open = True
+            self._speaker_available = True
+            print(
+                f"[JARVIS] Audio output ready: {sd.query_devices(stream.device)['name']} "
+                f"({stream_rate} Hz, {stream_channels} ch)"
+            )
             while True:
                 chunk = await self.audio_in_queue.get()
+                if chunk is None or generation != self._output_device_generation:
+                    return
                 if self.ui.muted:
                     while self.audio_in_queue and not self.audio_in_queue.empty():
                         try:
@@ -920,26 +1394,72 @@ class JarvisLive:
                 feed_visual = getattr(self.ui, "feed_output_audio", None)
                 if feed_visual is not None:
                     feed_visual(chunk, RECEIVE_SAMPLE_RATE)
-                await asyncio.to_thread(stream.write, chunk)
+                device_chunk = _convert_pcm16(
+                    chunk,
+                    RECEIVE_SAMPLE_RATE,
+                    stream_rate,
+                    CHANNELS,
+                    stream_channels,
+                )
+                await asyncio.to_thread(stream.write, device_chunk)
                 while True:
                     try:
                         chunk = await asyncio.wait_for(self.audio_in_queue.get(), timeout=0.18)
                     except asyncio.TimeoutError:
                         self.set_speaking(False)
                         break
+                    if chunk is None or generation != self._output_device_generation:
+                        return
                     if self.ui.muted:
                         self.set_speaking(False)
                         break
                     if feed_visual is not None:
                         feed_visual(chunk, RECEIVE_SAMPLE_RATE)
-                    await asyncio.to_thread(stream.write, chunk)
+                    device_chunk = _convert_pcm16(
+                        chunk,
+                        RECEIVE_SAMPLE_RATE,
+                        stream_rate,
+                        CHANNELS,
+                        stream_channels,
+                    )
+                    await asyncio.to_thread(stream.write, device_chunk)
         except Exception as e:
-            print(f"[JARVIS] ? Play: {e}")
+            print(f"[JARVIS] Playback error: {e}")
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            self._output_stream_open = False
+            with contextlib.suppress(Exception):
+                stream.stop()
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    async def _play_audio_resilient(self):
+        """Reopen audio output after device changes or temporary failures."""
+        while True:
+            if getattr(self, "_audio_backend_refreshing", False):
+                await asyncio.sleep(0.05)
+                continue
+            try:
+                await self._play_audio()
+                continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                first_failure = self._speaker_available is not False
+                self._speaker_available = False
+                print(f"[JARVIS] Audio output unavailable: {exc}")
+                if first_failure:
+                    self.ui.write_log(
+                        "WARN: Audio output unavailable. Select another output "
+                        "device in Settings to restore sound."
+                    )
+                while self.audio_in_queue and not self.audio_in_queue.empty():
+                    try:
+                        self.audio_in_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                await asyncio.sleep(5.0)
 
     async def run(self):
         _configure_live_transport()
@@ -951,8 +1471,9 @@ class JarvisLive:
         consecutive_failures = 0
         retry_delay = 3.0
         while True:
+            session_started_at = None
             try:
-                print("[JARVIS] ÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ…â€™ Connecting...")
+                print("[JARVIS] Connecting...")
                 # Keep ERROR stable while retrying in the background. The
                 # previous ERROR -> THINKING -> ERROR cycle every three
                 # seconds looked like a broken, flickering interface.
@@ -964,48 +1485,70 @@ class JarvisLive:
                     client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
+                    session_started_at = time.monotonic()
                     self.session        = session
                     self._loop          = asyncio.get_event_loop()
                     self.audio_in_queue = asyncio.Queue()
                     self.out_queue      = asyncio.Queue(maxsize=10)
                     self.mic_raw_queue  = asyncio.Queue(maxsize=40)
+                    if self._audio_backend_refresh_pending:
+                        try:
+                            await asyncio.to_thread(_restart_portaudio_backend)
+                            self._audio_backend_refresh_pending = False
+                            refresh_ui = getattr(self.ui, "refresh_audio_devices", None)
+                            if refresh_ui is not None:
+                                refresh_ui()
+                        except Exception as exc:
+                            self.ui.write_log(f"ERR: No se pudo inicializar el audio: {exc}")
 
-                    print("[JARVIS] ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Connected.")
-                    consecutive_failures = 0
-                    retry_delay = 3.0
+                    print("[JARVIS] Connected.")
                     self.ui.set_state("LISTENING" if self.wake_gate.active else "STANDBY")
                     mode_msg = "continuous listening" if self.wake_gate.mode == "continuous" else "say 'Hey Jarvis'"
                     self.ui.write_log(f"SYS: JARVIS online; {mode_msg}.")
 
                     tg.create_task(self._send_realtime())
-                    tg.create_task(self._listen_audio())
+                    tg.create_task(self._listen_audio_resilient())
                     tg.create_task(self._process_mic_audio())
                     tg.create_task(self._receive_audio())
-                    tg.create_task(self._play_audio())
+                    tg.create_task(self._play_audio_resilient())
                     
             except Exception as e:
-                print(f"[JARVIS] ÃƒÂ¢Ã…Â¡Ã‚Â ÃƒÂ¯Ã‚Â¸Ã‚Â {e}")
-                traceback.print_exc()
-                # The kiosk normally hides its terminal. Persist the real
-                # exception so the visible ERROR state can be diagnosed over
-                # SSH without guessing whether Gemini, audio or networking
-                # caused it.
+                summary = _live_error_summary(e)
+                transient = _is_transient_live_error(e)
+                connected_seconds = (
+                    time.monotonic() - session_started_at if session_started_at is not None else 0.0
+                )
+                if connected_seconds >= 30.0:
+                    consecutive_failures = 0
+                    retry_delay = 3.0
+                consecutive_failures += 1
+                escalated = not transient or consecutive_failures >= 4
+                print(f"[JARVIS] Live session interrupted: {summary}")
+                if escalated:
+                    traceback.print_exc()
                 try:
                     with RUNTIME_LOG_PATH.open("a", encoding="utf-8") as handle:
+                        level = "ERROR" if escalated else "WARN"
                         handle.write(
                             f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                            f"{type(e).__name__}: {e}\n"
+                            f"{level} live_session: {summary}\n"
                         )
-                        traceback.print_exc(file=handle)
+                        if escalated:
+                            traceback.print_exc(file=handle)
                 except Exception:
                     pass
-                self.ui.write_log(f"ERR: {type(e).__name__}: {str(e)[:160]}")
+                if escalated:
+                    self.ui.write_log(f"ERR: Gemini no pudo mantener la conexión: {summary[:160]}")
+                    self.ui.set_state("ERROR")
+                else:
+                    self.ui.write_log(
+                        "WARN: La conexión con Gemini se interrumpió; "
+                        "JARVIS se reconectará automáticamente."
+                    )
+                    self.ui.set_state("STANDBY")
 
             self.set_speaking(False)
             self.session = None
-            consecutive_failures += 1
-            if consecutive_failures == 1:
-                self.ui.set_state("ERROR")
             delay = retry_delay
             print(f"[JARVIS] Reconnecting in {delay:.0f}s...")
             await asyncio.sleep(delay)
@@ -1025,7 +1568,7 @@ def main():
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
-            print("\nÃƒÂ°Ã…Â¸Ã¢â‚¬ÂÃ‚Â´ Shutting down...")
+            print("\n[JARVIS] Shutting down...")
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()

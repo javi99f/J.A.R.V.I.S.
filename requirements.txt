@@ -8,5 +8,6 @@ ddgs>=9,<10
 psutil>=5.9,<8
 Pillow>=10,<13
 PyAutoGUI>=0.9.54,<1
+pywinauto==0.6.9; platform_system == "Windows"
 numpy>=1.26,<3
 openwakeword==0.6.0

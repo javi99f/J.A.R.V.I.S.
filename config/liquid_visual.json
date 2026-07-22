@@ -5,5 +5,6 @@
   "assistant_size": 109,
   "quality": "balanced",
   "droplets": true,
-  "reduced_motion": false
+  "reduced_motion": false,
+  "computer_control_enabled": true
 }

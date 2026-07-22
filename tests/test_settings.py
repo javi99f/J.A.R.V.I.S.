@@ -31,6 +31,25 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(settings.get_secret("LIVE_IP_MODE"), "ipv4-first")
             self.assertEqual(settings.get_secret("LIVE_USE_SYSTEM_PROXY"), "0")
 
+    def test_audio_device_selection_is_persisted_without_losing_keys(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / ".env"
+            path.write_text("GEMINI_API_KEY=test-key\nINPUT_DEVICE=2\n", encoding="utf-8")
+            with patch.object(settings, "ENV_FILE", path):
+                settings.write_audio_devices(7, 11, "USB Microphone", "USB Speakers")
+                saved = settings._parse_env_file(path)
+                self.assertEqual(saved["GEMINI_API_KEY"], "test-key")
+                self.assertEqual(saved["INPUT_DEVICE"], "7")
+                self.assertEqual(saved["OUTPUT_DEVICE"], "11")
+                self.assertEqual(saved["INPUT_DEVICE_NAME"], "USB Microphone")
+                self.assertEqual(saved["OUTPUT_DEVICE_NAME"], "USB Speakers")
+                settings.write_audio_devices(None, 11)
+                saved = settings._parse_env_file(path)
+                self.assertNotIn("INPUT_DEVICE", saved)
+                self.assertNotIn("INPUT_DEVICE_NAME", saved)
+                self.assertEqual(saved["OUTPUT_DEVICE"], "11")
+                self.assertEqual(saved["OUTPUT_DEVICE_NAME"], "USB Speakers")
+
 
 if __name__ == "__main__":
     unittest.main()

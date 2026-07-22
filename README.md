@@ -1,13 +1,21 @@
-# JARVIS Personal Assistant
+# J.A.R.V.I.S
 
-A Raspberry Pi voice assistant built for a vertical 800x1200 touchscreen. It uses a cinematic full-screen HUD, Gemini Live voice conversation, optional OpenRouter helper actions, optional Zernio social analytics, Pi device controls, and optional Home Assistant smart-home control.
+JARVIS has two interfaces over the same Gemini Live runtime: a Raspberry Pi
+touchscreen appliance and a native Windows 10/11 desktop assistant. The Pi
+edition provides its full-screen HUD and hardware/home tools. The Windows
+edition provides its transparent animated orb, selectable audio endpoints,
+local history and memory, and constrained multi-step application control.
 
 This customized branch adds a privacy-preserving local `Hey Jarvis` wake word,
 a Siri-style follow-up conversation window, explicit audio-device selection,
 microphone diagnostics, generic Bluetooth configuration, and a Raspberry Pi 4
 installer. See `RASPBERRY_PI_4_TEST.md` for the physical test procedure.
 
-This project is intentionally Pi-first. It does not include desktop automation, browser control, mouse/keyboard control, file management, games, or Windows/macOS actions.
+The Windows edition can interact with ordinary applications and the default
+browser within explicit safety limits. It blocks terminals, Registry Editor,
+Windows settings, installers, arbitrary executable paths and critical system
+shortcuts. It does not provide unrestricted file or system administration.
+See `DESKTOP_WINDOWS.md` for installation, privacy boundaries and diagnostics.
 
 ## Features
 
@@ -22,6 +30,10 @@ This project is intentionally Pi-first. It does not include desktop automation, 
 - Optional Zernio-powered Instagram/TikTok analytics through natural language
 - Optional OpenRouter-backed public question answering and helper responses
 - Secure remote updates from public GitHub Releases, with confirmation, backup, validation, and rollback
+- Medium-depth reasoning with persistent, verifiable plans for genuinely complex multi-step tasks
+- SQLite long-term memory with relevance retrieval, legacy JSON migration, secret filtering, and user controls to search, edit, and delete memories
+- Native Windows installer with bundled dependencies and a packaged self-test
+- Safe Windows browser/application interaction with local confirmation for consequential actions
 
 ## Hardware You Need
 
@@ -37,18 +49,25 @@ Create one local setup file: `.env`.
 
 That is the only file a normal user needs to edit for their own keys, URLs, and tokens. Copy it from `.env.example`, fill in their own values, and keep it private.
 
-Required:
+Required for both editions:
 
 - `GEMINI_API_KEY` - used for the live voice assistant
-- `OPENROUTER_API_KEY` - used for helper answering and fallback model calls
 
 Optional:
 
+- `OPENROUTER_API_KEY` - enables an optional helper backend; normal Gemini Live conversation does not require it
 - `ZERNIO_API_KEY` - enables Instagram/TikTok analytics questions
 - `HOME_ASSISTANT_URL` - your Home Assistant base URL
 - `HOME_ASSISTANT_TOKEN` - a Home Assistant long-lived access token
 
 Never commit `.env` or real credentials. This repo ignores `.env`, local config files, runtime state, memory JSON, logs, and PID files.
+
+## Install On Windows
+
+Use `dist-installer/Jarvis-Setup.exe`; no separate Python or dependency install
+is required. On first launch, JARVIS shows a protected field for the user's own
+Gemini key and a direct link to Google AI Studio. No shared API key is bundled.
+See `DESKTOP_WINDOWS.md` for the complete Windows workflow.
 
 ## Install On Raspberry Pi
 
@@ -206,11 +225,11 @@ sudo reboot
 
 ## Remote Updates
 
-Version 0.4.0 can check and install Raspberry Pi updates published through a
+Version 0.5.1 can check and install Raspberry Pi updates published through a
 public GitHub repository. Configure the repository in `.env`:
 
 ```env
-UPDATE_REPOSITORY=your-github-user/Jarvis
+UPDATE_REPOSITORY=javi99f/J.A.R.V.I.S.
 UPDATE_ALLOW_PRERELEASE=0
 ```
 
@@ -229,7 +248,9 @@ memory, visual settings, and audio configuration are preserved. See
 - `omar_ai_core/tools/social_metrics.py` - Zernio Instagram/TikTok analytics
 - `omar_ai_core/tools/web_lookup.py` - public lookup helper
 - `omar_ai_core/state/listening.py` - shared listening mute state for voice and SSH control
-- `omar_ai_core/memory/` - lightweight local memory helpers
+- `omar_ai_core/memory/` - SQLite long-term memory, relevance retrieval, migration, and privacy filtering
+- `omar_ai_core/planning.py` - persistent, verifiable multi-step task plans
+- `omar_ai_core/self_test.py` - packaged offline checks for wake word, audio, memory, planning, UI, and runtime tools
 - `omar_ai_core/persona/system_prompt.txt` - assistant behavior prompt
 - `assistantctl` - SSH command-line listening mute control
 - `launch_assistant.sh` - Raspberry Pi desktop launch helper
@@ -241,7 +262,7 @@ Before pushing this repo online:
 
 ```bash
 git status --short
-git check-ignore -v .env config/home_assistant.json config/api_keys.json memory/long_term.json
+git check-ignore -v .env config/home_assistant.json config/api_keys.json memory/long_term.json memory/jarvis-memory.db
 ```
 
 Confirm that `.env` and local JSON state files are ignored. If a real token was ever committed to an old git history, rotate that token and publish from a fresh git history.

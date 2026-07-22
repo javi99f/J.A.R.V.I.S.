@@ -1,5 +1,5 @@
 #define MyAppName "Jarvis"
-#define MyAppVersion "0.4.0"
+#define MyAppVersion "0.5.1"
 #define MyAppPublisher "Personal AI Lab"
 #define MyAppExeName "Jarvis.exe"
 

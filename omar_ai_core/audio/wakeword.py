@@ -37,7 +37,9 @@ class WakeWordGate:
 
     def _load_model(self) -> None:
         try:
-            from openwakeword.model import Model
+            from .openwakeword_runtime import load_model_class
+
+            Model = load_model_class()
 
             # The bundled model recognises "hey jarvis". VAD reduces accidental
             # activations caused by fans, television and constant room noise.

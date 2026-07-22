@@ -18,7 +18,7 @@ a = Analysis(
     hiddenimports=[
         "onnxruntime", "sounddevice", "cffi",
         "PyQt6.QtQml", "PyQt6.QtQuick", "PyQt6.QtQuickWidgets",
-        "PyQt6.QtOpenGL", "PyQt6.QtOpenGLWidgets",
+        "PyQt6.QtOpenGL", "PyQt6.QtOpenGLWidgets", "PyQt6.QtMultimedia",
     ],
     hookspath=[],
     runtime_hooks=[],

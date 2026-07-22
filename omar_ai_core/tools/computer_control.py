@@ -13,11 +13,14 @@ import io
 import os
 import re
 import sys
+import threading
 import time
+import webbrowser
 from ctypes import wintypes
 from dataclasses import dataclass
-from difflib import get_close_matches
+from difflib import SequenceMatcher, get_close_matches
 from pathlib import Path
+from urllib.parse import quote_plus, urlparse
 
 from PIL import ImageGrab
 
@@ -59,6 +62,35 @@ HIGH_RISK_HOTKEYS = {
     frozenset({"ctrl", "w"}),
     frozenset({"ctrl", "shift", "w"}),
     frozenset({"shift", "delete"}),
+}
+
+INTERACTIVE_CONTROL_TYPES = {
+    "Button",
+    "CheckBox",
+    "ComboBox",
+    "DataItem",
+    "Edit",
+    "Hyperlink",
+    "ListItem",
+    "MenuItem",
+    "RadioButton",
+    "Slider",
+    "TabItem",
+    "TreeItem",
+}
+CONTEXT_CONTROL_TYPES = {"Document", "Group", "Pane", "Text"}
+SENSITIVE_CONTROL_TERMS = {
+    "buy", "purchase", "pay", "checkout", "delete", "remove", "uninstall",
+    "send", "publish", "post", "upload", "share", "factory reset", "format",
+    "comprar", "pagar", "eliminar", "borrar", "desinstalar", "enviar",
+    "publicar", "subir", "compartir", "restablecer", "formatear",
+}
+CONTROL_SNAPSHOT_MAX_AGE = 45.0
+_control_snapshot_lock = threading.Lock()
+_control_snapshot: dict[str, object] = {
+    "window_handle": 0,
+    "created_at": 0.0,
+    "controls": {},
 }
 
 VK = {
@@ -182,6 +214,334 @@ def active_window() -> dict[str, object]:
         "title": title_buffer.value,
         "process": process_name,
         "pid": int(pid.value),
+        "handle": int(hwnd),
+    }
+
+
+def _uia_desktop():
+    _require_windows()
+    try:
+        from pywinauto import Desktop
+    except ImportError as exc:
+        raise ComputerControlError(
+            "Windows semantic UI control is unavailable because pywinauto is not installed."
+        ) from exc
+    return Desktop(backend="uia")
+
+
+def _control_text(control) -> str:
+    info = getattr(control, "element_info", None)
+    value = str(getattr(info, "name", "") or "").strip()
+    if value:
+        return re.sub(r"\s+", " ", value)
+    try:
+        return re.sub(r"\s+", " ", str(control.window_text() or "").strip())
+    except Exception:
+        return ""
+
+
+def _control_record(control, ref: str) -> dict[str, object] | None:
+    info = getattr(control, "element_info", None)
+    control_type = str(getattr(info, "control_type", "") or "")
+    if control_type not in INTERACTIVE_CONTROL_TYPES | CONTEXT_CONTROL_TYPES:
+        return None
+    try:
+        if not control.is_visible():
+            return None
+    except Exception:
+        pass
+    name = _control_text(control)
+    if not name and control_type not in {"Edit", "ComboBox", "Document"}:
+        return None
+    try:
+        rect = control.rectangle()
+        bounds = [int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)]
+    except Exception:
+        bounds = []
+    try:
+        enabled = bool(control.is_enabled())
+    except Exception:
+        enabled = True
+    return {
+        "ref": ref,
+        "name": name[:180],
+        "control_type": control_type,
+        "automation_id": str(getattr(info, "automation_id", "") or "")[:120],
+        "class_name": str(getattr(info, "class_name", "") or "")[:120],
+        "enabled": enabled,
+        "password": bool(getattr(info, "is_password", False)),
+        "bounds": bounds,
+    }
+
+
+def inspect_ui_controls(limit: int = 80) -> dict[str, object]:
+    """Return named UI Automation controls from the active window and cache refs."""
+    window_info = active_window()
+    handle = int(window_info.get("handle") or 0)
+    if not handle:
+        raise ComputerControlError("There is no active application window to inspect.")
+    maximum = max(10, min(int(limit), 120))
+    try:
+        root = _uia_desktop().window(handle=handle)
+        descendants = root.descendants()
+    except Exception as exc:
+        raise ComputerControlError(f"Could not inspect the active application's controls: {exc}") from exc
+
+    candidates: list[tuple[int, object, dict[str, object]]] = []
+    seen: set[tuple] = set()
+    for control in descendants:
+        record = _control_record(control, "")
+        if record is None:
+            continue
+        signature = (
+            record["name"],
+            record["control_type"],
+            record["automation_id"],
+            tuple(record["bounds"]),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        priority = 0 if record["control_type"] in INTERACTIVE_CONTROL_TYPES else 1
+        candidates.append((priority, control, record))
+
+    candidates.sort(key=lambda item: item[0])
+    controls: dict[str, object] = {}
+    records: list[dict[str, object]] = []
+    for index, (_, control, record) in enumerate(candidates[:maximum], start=1):
+        ref = f"ui{index}"
+        record["ref"] = ref
+        controls[ref] = control
+        records.append(record)
+
+    with _control_snapshot_lock:
+        _control_snapshot["window_handle"] = handle
+        _control_snapshot["created_at"] = time.monotonic()
+        _control_snapshot["controls"] = controls
+
+    return {
+        "active_window": window_info.get("title", ""),
+        "active_process": window_info.get("process", ""),
+        "control_count": len(records),
+        "controls": records,
+        "instructions": (
+            "Use click_control or type_into_control with a ref from this snapshot. "
+            "Inspect again after navigation, dialogs, page loads, or other visual changes. "
+            "If the needed control is absent, use observe and coordinate actions as a fallback."
+        ),
+    }
+
+
+def find_ui_controls(query: object, limit: int = 20) -> dict[str, object]:
+    """Search the complete active UI tree instead of truncating its first controls."""
+    wanted = _normal(query)
+    if not wanted:
+        raise ComputerControlError("query is required to find a UI control.")
+    window_info = active_window()
+    handle = int(window_info.get("handle") or 0)
+    if not handle:
+        raise ComputerControlError("There is no active application window to inspect.")
+    try:
+        descendants = _uia_desktop().window(handle=handle).descendants()
+    except Exception as exc:
+        raise ComputerControlError(f"Could not search the active application's controls: {exc}") from exc
+
+    wanted_terms = set(wanted.split())
+    candidates: list[tuple[float, int, object, dict[str, object]]] = []
+    seen: set[tuple] = set()
+    for order, control in enumerate(descendants):
+        record = _control_record(control, "")
+        if record is None:
+            continue
+        signature = (
+            record["name"],
+            record["control_type"],
+            record["automation_id"],
+            tuple(record["bounds"]),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        searchable = _normal(
+            " ".join(
+                (
+                    str(record["name"]),
+                    str(record["automation_id"]),
+                    str(record["class_name"]),
+                )
+            )
+        )
+        searchable_terms = set(searchable.split())
+        ratio = SequenceMatcher(None, wanted, searchable).ratio()
+        if searchable == wanted:
+            score = 1000.0
+        elif wanted in searchable:
+            score = 850.0 - min(200.0, len(searchable) - len(wanted))
+        elif wanted_terms and wanted_terms.issubset(searchable_terms):
+            score = 700.0 + (100.0 * len(wanted_terms) / max(1, len(searchable_terms)))
+        elif ratio >= 0.48:
+            score = ratio * 500.0
+        else:
+            continue
+        if record["control_type"] in INTERACTIVE_CONTROL_TYPES:
+            score += 75.0
+        if not record["enabled"]:
+            score -= 150.0
+        candidates.append((score, order, control, record))
+
+    maximum = max(1, min(int(limit), 40))
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+    controls: dict[str, object] = {}
+    records: list[dict[str, object]] = []
+    for index, (score, _order, control, record) in enumerate(candidates[:maximum], start=1):
+        ref = f"ui{index}"
+        record["ref"] = ref
+        record["match_score"] = round(score, 1)
+        controls[ref] = control
+        records.append(record)
+
+    with _control_snapshot_lock:
+        _control_snapshot["window_handle"] = handle
+        _control_snapshot["created_at"] = time.monotonic()
+        _control_snapshot["controls"] = controls
+
+    return {
+        "active_window": window_info.get("title", ""),
+        "active_process": window_info.get("process", ""),
+        "query": str(query),
+        "match_count": len(records),
+        "controls": records,
+        "instructions": (
+            "Use click_control or type_into_control with a returned ref. "
+            "Search again after any navigation or page update."
+        ),
+    }
+
+
+def click_named_ui_control(parameters: dict) -> dict[str, object]:
+    """Find and activate an unambiguous named control in one safe operation."""
+    query = str(parameters.get("query") or "").strip()
+    matches = find_ui_controls(query, int(parameters.get("limit", 12)))
+    records = list(matches.get("controls") or [])
+    interactive = [
+        item for item in records
+        if item.get("enabled") and item.get("control_type") in INTERACTIVE_CONTROL_TYPES
+    ]
+    exact = [item for item in interactive if _normal(item.get("name")) == _normal(query)]
+    chosen = exact[0] if exact else (interactive[0] if len(interactive) == 1 else None)
+    if chosen is None:
+        return {
+            "status": "No single unambiguous interactive control was activated.",
+            "query": query,
+            "candidates": records[:8],
+            "next_step": (
+                "Choose a candidate ref and call click_control, refine the query, "
+                "or use observe if the application does not expose semantic controls."
+            ),
+        }
+    result = click_ui_control({**parameters, "ref": chosen["ref"]})
+    result["matched_control"] = chosen
+    return result
+
+
+def _resolve_control_ref(ref: object):
+    value = str(ref or "").strip().lower()
+    if not re.fullmatch(r"ui\d+", value):
+        raise ComputerControlError("A valid control ref from the latest inspect_ui result is required.")
+    current_handle = int(active_window().get("handle") or 0)
+    with _control_snapshot_lock:
+        snapshot_handle = int(_control_snapshot.get("window_handle") or 0)
+        created_at = float(_control_snapshot.get("created_at") or 0.0)
+        controls = _control_snapshot.get("controls") or {}
+        control = controls.get(value) if isinstance(controls, dict) else None
+    if current_handle != snapshot_handle:
+        raise ComputerControlError("The active window changed. Call inspect_ui again before interacting.")
+    if time.monotonic() - created_at > CONTROL_SNAPSHOT_MAX_AGE:
+        raise ComputerControlError("The UI control snapshot expired. Call inspect_ui again.")
+    if control is None:
+        raise ComputerControlError(f"Unknown control ref: {value}. Call inspect_ui again.")
+    return control
+
+
+def _invalidate_control_snapshot() -> None:
+    with _control_snapshot_lock:
+        _control_snapshot["created_at"] = 0.0
+        _control_snapshot["controls"] = {}
+
+
+def _control_requires_confirmation(name: str) -> bool:
+    normalized = _normal(name)
+    return any(term in normalized for term in SENSITIVE_CONTROL_TERMS)
+
+
+def click_ui_control(parameters: dict) -> dict[str, object]:
+    control = _resolve_control_ref(parameters.get("ref"))
+    name = _control_text(control) or str(parameters.get("ref"))
+    _guard_interaction(
+        parameters,
+        f"activate the '{name[:120]}' control",
+        inherently_sensitive=_control_requires_confirmation(name),
+    )
+    method = "invoke"
+    try:
+        control.invoke()
+    except Exception:
+        method = "click_input"
+        try:
+            control.click_input()
+        except Exception as exc:
+            raise ComputerControlError(f"Could not activate the '{name}' control: {exc}") from exc
+    _invalidate_control_snapshot()
+    return {
+        "status": f"Activated control '{name}'.",
+        "method": method,
+        "next_step": "Wait for the application to update, then call inspect_ui or observe to verify the result.",
+    }
+
+
+def type_into_ui_control(parameters: dict) -> dict[str, object]:
+    control = _resolve_control_ref(parameters.get("ref"))
+    name = _control_text(control) or str(parameters.get("ref"))
+    info = getattr(control, "element_info", None)
+    if bool(getattr(info, "is_password", False)):
+        raise ComputerControlError("Typing into password fields is blocked by desktop safety mode.")
+    value = str(parameters.get("text") or "")
+    if not value:
+        raise ComputerControlError("text cannot be empty.")
+    if len(value) > 2000:
+        raise ComputerControlError("A single typing action is limited to 2000 characters.")
+    _guard_interaction(
+        parameters,
+        f"type {len(value)} characters into the '{name[:120]}' control",
+    )
+    replace = bool(parameters.get("replace", True))
+    method = "set_edit_text"
+    try:
+        if not replace:
+            raise AttributeError
+        control.set_edit_text(value)
+        control.set_focus()
+    except Exception:
+        method = "keyboard"
+        try:
+            control.click_input()
+        except Exception:
+            try:
+                control.set_focus()
+            except Exception as exc:
+                raise ComputerControlError(f"Could not focus the '{name}' control: {exc}") from exc
+        if replace:
+            _hotkey(["ctrl", "a"])
+        _type_text(value, float(parameters.get("interval", 0.01)))
+    submitted = bool(parameters.get("submit", False))
+    if submitted:
+        _press_key("enter")
+    _invalidate_control_snapshot()
+    return {
+        "status": f"Typed {len(value)} characters into '{name}'.",
+        "method": method,
+        "submitted": submitted,
+        "next_step": "Call inspect_ui or observe to verify the resulting application state.",
     }
 
 
@@ -287,6 +647,39 @@ def _launch_app(name: object) -> str:
         return f"No safe installed application matched '{name}'. Use list_apps to inspect available names."
     os.startfile(target)  # type: ignore[attr-defined]
     return f"Opened {Path(target).stem}."
+
+
+def _open_default_browser(url: object) -> dict[str, object]:
+    value = str(url or "").strip()
+    if len(value) > 2048:
+        raise ComputerControlError("URL is too long.")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ComputerControlError("Only complete http or https URLs can be opened.")
+    if parsed.username or parsed.password:
+        raise ComputerControlError("URLs containing embedded credentials are blocked.")
+    if not webbrowser.open(value, new=2, autoraise=True):
+        raise ComputerControlError("Windows could not open the default browser.")
+    return {
+        "status": "Opened the URL in the Windows default browser.",
+        "url": value,
+        "next_step": (
+            "Wait for the page, inspect_ui or find_ui for named controls, interact, "
+            "then inspect again until the requested end state is verified."
+        ),
+    }
+
+
+def _search_default_browser(query: object) -> dict[str, object]:
+    value = str(query or "").strip()
+    if not value:
+        raise ComputerControlError("query is required for a browser search.")
+    if len(value) > 500:
+        raise ComputerControlError("Browser search query is limited to 500 characters.")
+    result = _open_default_browser(f"https://www.google.com/search?q={quote_plus(value)}")
+    result["status"] = "Opened Google results in the Windows default browser."
+    result["query"] = value
+    return result
 
 
 def _screen_point(x: object, y: object) -> tuple[int, int]:
@@ -463,6 +856,20 @@ def computer_control(parameters: dict, player=None) -> object:
         return {"safe_apps": list_safe_apps(int(parameters.get("limit", 80)))}
     if action == "open_app":
         return _launch_app(parameters.get("app"))
+    if action in {"browser_search", "search_browser", "search_web"}:
+        return _search_default_browser(parameters.get("query") or parameters.get("text"))
+    if action in {"open_url", "browse_url"}:
+        return _open_default_browser(parameters.get("url"))
+    if action in {"inspect_ui", "inspect_controls"}:
+        return inspect_ui_controls(int(parameters.get("limit", 80)))
+    if action in {"find_ui", "find_control", "search_controls"}:
+        return find_ui_controls(parameters.get("query"), int(parameters.get("limit", 20)))
+    if action in {"click_named", "activate_named"}:
+        return click_named_ui_control(parameters)
+    if action in {"click_control", "invoke_control"}:
+        return click_ui_control(parameters)
+    if action in {"type_into_control", "set_control_text"}:
+        return type_into_ui_control(parameters)
     if action in {"active_window", "window_status"}:
         return active_window()
     if action == "wait":
@@ -530,6 +937,7 @@ def computer_control(parameters: dict, player=None) -> object:
         return f"Pressed {' + '.join(normalized)}."
 
     raise ComputerControlError(
-        "Unknown action. Use observe, list_apps, open_app, active_window, click, double_click, "
+        "Unknown action. Use observe, browser_search, open_url, inspect_ui, find_ui, click_named, "
+        "click_control, type_into_control, list_apps, open_app, active_window, click, double_click, "
         "right_click, move, drag, scroll, type_text, press_key, hotkey, or wait."
     )

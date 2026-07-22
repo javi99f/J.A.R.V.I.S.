@@ -1,10 +1,17 @@
 import time
 import unittest
+import sys
 
 from omar_ai_core.audio.wakeword import WakeWordGate
 
 
 class WakeWordGateTests(unittest.TestCase):
+    def test_inference_backend_does_not_load_training_dependencies(self):
+        gate = WakeWordGate(mode="wakeword")
+        self.assertTrue(gate.available, gate.error)
+        self.assertIsNotNone(gate._model)
+        self.assertNotIn("openwakeword.custom_verifier_model", sys.modules)
+
     def test_continuous_mode_is_always_active(self):
         gate = WakeWordGate(mode="continuous")
         self.assertTrue(gate.available)
@@ -32,4 +39,3 @@ class WakeWordGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

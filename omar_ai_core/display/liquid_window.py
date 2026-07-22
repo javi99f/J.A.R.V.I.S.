@@ -4,6 +4,11 @@ import sys
 import threading
 import time
 
+import sounddevice as sd
+try:
+    from PyQt6.QtMultimedia import QMediaDevices
+except ImportError:  # Optional on minimal Linux/Pi Qt installations.
+    QMediaDevices = None
 from PyQt6.QtCore import (
     QEasingCurve,
     QPropertyAnimation,
@@ -23,23 +28,40 @@ from PyQt6.QtGui import (
     QShortcut,
 )
 from PyQt6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
+    QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSlider,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from omar_ai_core.settings import BASE_DIR, is_configured, write_env
+from omar_ai_core.settings import (
+    BASE_DIR,
+    get_secret,
+    is_configured,
+    write_audio_devices,
+    write_env,
+)
+from omar_ai_core.history import append_history, read_diagnostics, read_history
+from omar_ai_core.memory.store import clear_memories, delete_memory, list_memories, remember
 
 from .assistant_state import AssistantState, normalize_state, state_label
 from .audio_reactive import AudioReactiveAnalyzer
@@ -68,8 +90,364 @@ class _RootShim:
         return None
 
 
+def _device_id_from_setting(name: str) -> int | None:
+    value = get_secret(name)
+    try:
+        return int(value) if value else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _friendly_audio_device_name(name: str, fallback: str) -> str:
+    name = str(name or fallback).strip()
+    primary, separator, details = name.partition(" (")
+    primary = primary.strip()
+    details = details.rstrip(")").strip()
+    # "Altavoces" and "Micrófono" are generic endpoint roles. Windows shows
+    # the useful hardware identity (for example "USB Audio and HID") directly
+    # below them, so use that identity in Jarvis. Named displays/headsets keep
+    # their real endpoint name.
+    generic_roles = {
+        "altavoces",
+        "auriculares",
+        "headphones",
+        "microphone",
+        "micrófono",
+        "speakers",
+    }
+    if separator and details and primary.casefold() in generic_roles:
+        return details
+    return primary or details or fallback
+
+
+def enumerate_audio_devices(
+    direction: str,
+    devices=None,
+    hostapis=None,
+) -> list[tuple[str, int]]:
+    channel_key = "max_input_channels" if direction == "input" else "max_output_channels"
+    source = sd.query_devices() if devices is None else devices
+    if hostapis is None and devices is None:
+        hostapis = sd.query_hostapis()
+    preferred_hostapis = {
+        index
+        for index, hostapi in enumerate(hostapis or [])
+        if "WASAPI" in str(hostapi.get("name", "")).upper()
+    }
+    result = []
+    for index, device in enumerate(source):
+        try:
+            channels = int(device.get(channel_key, 0))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if channels <= 0:
+            continue
+        if preferred_hostapis and device.get("hostapi") not in preferred_hostapis:
+            continue
+        name = _friendly_audio_device_name(
+            device.get("name"),
+            f"Dispositivo {index}",
+        )
+        result.append((name, index))
+    return result
+
+
+def _canonical_audio_device(
+    selected_device: int | None,
+    devices,
+    candidates: list[tuple[str, int]],
+    selected_label: str = "",
+) -> int | None:
+    if selected_device is None:
+        return None
+    candidate_ids = {device_id for _label, device_id in candidates}
+    if selected_label:
+        matching_ids = [
+            device_id
+            for label, device_id in candidates
+            if label.casefold() == selected_label.casefold()
+        ]
+        if selected_device in matching_ids:
+            return selected_device
+        if matching_ids:
+            return matching_ids[0]
+        # A vanished saved endpoint must fall back to the Windows default.  Do
+        # not silently bind to an unrelated device that reused its old index.
+        return None
+    if selected_device in candidate_ids and not selected_label:
+        return selected_device
+    try:
+        old_device = devices[selected_device]
+        old_name = _friendly_audio_device_name(old_device.get("name"), "").casefold()
+    except (IndexError, KeyError, TypeError):
+        return None
+    for label, device_id in candidates:
+        if label.casefold() == old_name:
+            return device_id
+    return None
+
+
+class HistoryDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Historial de Jarvis")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.resize(720, 480)
+        self.setMinimumSize(520, 340)
+        self.setStyleSheet(
+            """
+            QDialog { background: #100c0e; color: #f6e3e6; }
+            QLabel { color: #f6e3e6; font-size: 13px; font-weight: 600; }
+            QTabWidget::pane {
+                border: 1px solid rgba(232,154,36,105);
+                background: #171315;
+            }
+            QTabBar::tab {
+                color: rgba(244,220,224,210); background: #171315;
+                border: 1px solid rgba(232,154,36,70);
+                padding: 7px 14px;
+            }
+            QTabBar::tab:selected { color: white; background: #2a2020; }
+            QPlainTextEdit {
+                color: #f3e5e7; background: #171315; border: none;
+                selection-background-color: #8c5a18;
+                font-family: Consolas, "Courier New"; font-size: 11px;
+            }
+            QPushButton {
+                color: #f6e3e6; background: rgba(255,255,255,12);
+                border: 1px solid rgba(232,154,36,105); border-radius: 8px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover { background: rgba(232,154,36,40); }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+        root.addWidget(QLabel("HISTORIAL Y DIAGNÓSTICO"))
+
+        tabs = QTabWidget()
+        self.conversation = QPlainTextEdit()
+        self.conversation.setReadOnly(True)
+        self.conversation.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.diagnostics = QPlainTextEdit()
+        self.diagnostics.setReadOnly(True)
+        self.diagnostics.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        tabs.addTab(self.conversation, "CONVERSACIÓN")
+        tabs.addTab(self.diagnostics, "ERRORES")
+        root.addWidget(tabs, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        refresh = QPushButton("ACTUALIZAR")
+        refresh.clicked.connect(self.refresh)
+        close = QPushButton("CERRAR")
+        close.clicked.connect(self.close)
+        actions.addWidget(refresh)
+        actions.addWidget(close)
+        root.addLayout(actions)
+        self.refresh()
+
+    def refresh(self) -> None:
+        history = read_history() or "Todavía no hay conversaciones registradas."
+        diagnostics = read_diagnostics() or "No hay errores registrados."
+        self.conversation.setPlainText(history)
+        self.diagnostics.setPlainText(diagnostics)
+        self.conversation.moveCursor(self.conversation.textCursor().MoveOperation.End)
+        self.diagnostics.moveCursor(self.diagnostics.textCursor().MoveOperation.End)
+
+
+class MemoryDialog(QDialog):
+    CATEGORIES = [
+        "identity",
+        "preferences",
+        "projects",
+        "relationships",
+        "wishes",
+        "notes",
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Memoria de Jarvis")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.resize(820, 500)
+        self.setMinimumSize(620, 360)
+        self.setStyleSheet(
+            """
+            QDialog { background: #100c0e; color: #f6e3e6; }
+            QLabel { color: #f6e3e6; font-size: 13px; font-weight: 600; }
+            QLineEdit, QTableWidget {
+                color: #f3e5e7; background: #171315;
+                border: 1px solid rgba(232,154,36,105);
+                selection-background-color: #704514;
+            }
+            QLineEdit { border-radius: 8px; padding: 6px 9px; }
+            QHeaderView::section {
+                color: #f3e5e7; background: #2a2020;
+                border: none; border-right: 1px solid rgba(232,154,36,55);
+                padding: 6px;
+            }
+            QPushButton {
+                color: #f6e3e6; background: rgba(255,255,255,12);
+                border: 1px solid rgba(232,154,36,105); border-radius: 8px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover { background: rgba(232,154,36,40); }
+            """
+        )
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(8)
+
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("MEMORIA A LARGO PLAZO"))
+        title_row.addStretch()
+        self.count_label = QLabel("")
+        self.count_label.setFont(QFont("Segoe UI", 9))
+        title_row.addWidget(self.count_label)
+        root.addLayout(title_row)
+
+        search_row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Buscar recuerdos…")
+        self.search.returnPressed.connect(self.refresh)
+        search_row.addWidget(self.search, 1)
+        refresh = QPushButton("BUSCAR")
+        refresh.clicked.connect(self.refresh)
+        search_row.addWidget(refresh)
+        root.addLayout(search_row)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(
+            ["CATEGORÍA", "CLAVE", "RECUERDO", "IMPORTANCIA", "ACTUALIZADO"]
+        )
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.doubleClicked.connect(self.edit_selected)
+        root.addWidget(self.table, 1)
+
+        actions = QHBoxLayout()
+        add = QPushButton("AÑADIR")
+        add.clicked.connect(self.add_memory)
+        edit = QPushButton("EDITAR")
+        edit.clicked.connect(self.edit_selected)
+        delete = QPushButton("BORRAR")
+        delete.clicked.connect(self.delete_selected)
+        clear = QPushButton("BORRAR TODO")
+        clear.clicked.connect(self.clear_all)
+        close = QPushButton("CERRAR")
+        close.clicked.connect(self.close)
+        actions.addWidget(add)
+        actions.addWidget(edit)
+        actions.addWidget(delete)
+        actions.addStretch()
+        actions.addWidget(clear)
+        actions.addWidget(close)
+        root.addLayout(actions)
+        self.refresh()
+
+    def _selected_entry(self) -> dict | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        return item.data(Qt.ItemDataRole.UserRole) if item else None
+
+    def refresh(self) -> None:
+        entries = list_memories(self.search.text().strip(), limit=1000)
+        self.table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            values = (
+                entry["category"],
+                entry["key"],
+                entry["value"],
+                f"{float(entry['importance']) * 100:.0f}%",
+                str(entry["updated_at"])[:19].replace("T", " "),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, entry)
+                self.table.setItem(row, column, item)
+        self.count_label.setText(f"{len(entries)} recuerdos")
+
+    def add_memory(self) -> None:
+        category, accepted = QInputDialog.getItem(
+            self, "Nuevo recuerdo", "Categoría:", self.CATEGORIES, 5, False
+        )
+        if not accepted:
+            return
+        key, accepted = QInputDialog.getText(self, "Nuevo recuerdo", "Clave corta:")
+        if not accepted or not key.strip():
+            return
+        value, accepted = QInputDialog.getMultiLineText(self, "Nuevo recuerdo", "Contenido:")
+        if not accepted or not value.strip():
+            return
+        result = remember(key, value, category, importance=0.7)
+        if result.startswith("Sensitive"):
+            QMessageBox.warning(self, "Memoria protegida", result)
+        self.refresh()
+
+    def edit_selected(self) -> None:
+        entry = self._selected_entry()
+        if not entry:
+            return
+        value, accepted = QInputDialog.getMultiLineText(
+            self,
+            "Editar recuerdo",
+            f"{entry['category']}/{entry['key']}:",
+            entry["value"],
+        )
+        if accepted and value.strip():
+            remember(
+                entry["key"],
+                value,
+                entry["category"],
+                importance=float(entry["importance"]),
+            )
+            self.refresh()
+
+    def delete_selected(self) -> None:
+        entry = self._selected_entry()
+        if not entry:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Borrar recuerdo",
+            f"¿Borrar {entry['category']}/{entry['key']}?",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            delete_memory(memory_id=int(entry["id"]))
+            self.refresh()
+
+    def clear_all(self) -> None:
+        answer = QMessageBox.warning(
+            self,
+            "Borrar toda la memoria",
+            "Esta acción borrará todos los recuerdos de Jarvis. ¿Continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            clear_memories()
+            self.refresh()
+
+
 class VisualSettingsPanel(QFrame):
     changed = pyqtSignal(object)
+    audio_devices_changed = pyqtSignal(object, object)
+    history_requested = pyqtSignal()
+    memory_requested = pyqtSignal()
 
     def __init__(self, settings: VisualSettings, parent=None):
         super().__init__(parent)
@@ -96,6 +474,12 @@ class VisualSettingsPanel(QFrame):
                 padding: 4px 8px;
             }
             QCheckBox { color: rgba(244, 220, 224, 215); spacing: 7px; }
+            QPushButton#historyButton {
+                color: #f6e3e6; background: rgba(255,255,255,12);
+                border: 1px solid rgba(232,154,36,105); border-radius: 7px;
+                padding: 3px 8px;
+            }
+            QPushButton#historyButton:hover { background: rgba(232,154,36,38); }
             """
         )
         root = QVBoxLayout(self)
@@ -135,8 +519,22 @@ class VisualSettingsPanel(QFrame):
         self.quality_combo.addItem("Alta", "high")
         quality_index = self.quality_combo.findData(settings.quality)
         self.quality_combo.setCurrentIndex(max(0, quality_index))
-        selectors.addWidget(self.quality_combo)
+        selectors.addWidget(self.quality_combo, 1)
+        self.history_button = QPushButton("HISTORIAL")
+        self.history_button.setObjectName("historyButton")
+        self.history_button.setFixedHeight(24)
+        self.history_button.setToolTip("Ver conversaciones, respuestas y errores")
+        selectors.addWidget(self.history_button)
+        self.memory_button = QPushButton("MEMORIA")
+        self.memory_button.setObjectName("historyButton")
+        self.memory_button.setFixedHeight(24)
+        self.memory_button.setToolTip("Ver, buscar, editar y borrar recuerdos")
+        selectors.addWidget(self.memory_button)
         root.addLayout(selectors)
+
+        self.input_device_combo = self._audio_device_row(root, "Entrada de audio")
+        self.output_device_combo = self._audio_device_row(root, "Salida de audio")
+        self.refresh_audio_devices()
 
         switches = QHBoxLayout()
         self.computer_control = QCheckBox("Control del PC")
@@ -156,6 +554,10 @@ class VisualSettingsPanel(QFrame):
         self.visibility.valueChanged.connect(self._publish)
         self.size.valueChanged.connect(self._publish)
         self.quality_combo.currentIndexChanged.connect(self._publish)
+        self.input_device_combo.currentIndexChanged.connect(self._publish_audio_devices)
+        self.output_device_combo.currentIndexChanged.connect(self._publish_audio_devices)
+        self.history_button.clicked.connect(self.history_requested.emit)
+        self.memory_button.clicked.connect(self.memory_requested.emit)
         self.computer_control.toggled.connect(self._publish)
         self.reduced.toggled.connect(self._publish)
 
@@ -194,6 +596,93 @@ class VisualSettingsPanel(QFrame):
         parent_layout.addLayout(row)
         return slider
 
+    def _audio_device_row(self, parent_layout: QVBoxLayout, text: str) -> QComboBox:
+        row = QHBoxLayout()
+        label = self._small_label(text)
+        label.setFixedWidth(82)
+        combo = QComboBox()
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(24)
+        combo.setToolTip(f"Seleccionar {text.lower()}")
+        row.addWidget(label)
+        row.addWidget(combo, 1)
+        parent_layout.addLayout(row)
+        return combo
+
+    @staticmethod
+    def _fill_audio_combo(
+        combo: QComboBox,
+        devices: list[tuple[str, int]],
+        selected_device: int | None,
+    ) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Predeterminado del sistema", None)
+        for label, device_id in devices:
+            combo.addItem(label, device_id)
+        selected_index = combo.findData(selected_device)
+        combo.setCurrentIndex(max(0, selected_index))
+        combo.blockSignals(False)
+
+    def refresh_audio_devices(self) -> None:
+        current_input_label = (
+            self.input_device_combo.currentText()
+            if self.input_device_combo.count()
+            else get_secret("INPUT_DEVICE_NAME")
+        )
+        current_output_label = (
+            self.output_device_combo.currentText()
+            if self.output_device_combo.count()
+            else get_secret("OUTPUT_DEVICE_NAME")
+        )
+        current_input = (
+            self.input_device_combo.currentData()
+            if self.input_device_combo.count()
+            else _device_id_from_setting("INPUT_DEVICE")
+        )
+        current_output = (
+            self.output_device_combo.currentData()
+            if self.output_device_combo.count()
+            else _device_id_from_setting("OUTPUT_DEVICE")
+        )
+        try:
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+            inputs = enumerate_audio_devices("input", devices, hostapis)
+            outputs = enumerate_audio_devices("output", devices, hostapis)
+        except Exception:
+            return
+        resolved_input = _canonical_audio_device(
+            current_input, devices, inputs, current_input_label
+        )
+        resolved_output = _canonical_audio_device(
+            current_output, devices, outputs, current_output_label
+        )
+        self._fill_audio_combo(self.input_device_combo, inputs, resolved_input)
+        self._fill_audio_combo(self.output_device_combo, outputs, resolved_output)
+        resolved_input_name = (
+            self.input_device_combo.currentText() if resolved_input is not None else ""
+        )
+        resolved_output_name = (
+            self.output_device_combo.currentText() if resolved_output is not None else ""
+        )
+        write_audio_devices(
+            resolved_input,
+            resolved_output,
+            resolved_input_name,
+            resolved_output_name,
+        )
+        if (resolved_input, resolved_output) != (current_input, current_output):
+            self.audio_devices_changed.emit(resolved_input, resolved_output)
+
+    def _publish_audio_devices(self, *_args) -> None:
+        input_device = self.input_device_combo.currentData()
+        output_device = self.output_device_combo.currentData()
+        input_name = self.input_device_combo.currentText() if input_device is not None else ""
+        output_name = self.output_device_combo.currentText() if output_device is not None else ""
+        write_audio_devices(input_device, output_device, input_name, output_name)
+        self.audio_devices_changed.emit(input_device, output_device)
+
     def _publish(self, *_args) -> None:
         self.settings.motion_intensity = self.motion.value() / 100.0
         self.settings.microphone_sensitivity = self.sensitivity.value() / 100.0
@@ -209,6 +698,7 @@ class VisualSettingsPanel(QFrame):
 class LiquidMainWindow(QMainWindow):
     state_signal = pyqtSignal(str)
     log_signal = pyqtSignal(str)
+    audio_refresh_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -225,6 +715,8 @@ class LiquidMainWindow(QMainWindow):
 
         self.on_text_command = None
         self.on_manual_activate = None
+        self.on_audio_devices_changed = None
+        self.on_audio_refresh_requested = None
         self._muted = False
         self._current_file: str | None = None
         self._ready = is_configured()
@@ -232,6 +724,10 @@ class LiquidMainWindow(QMainWindow):
         self._panel_visible = False
         self._settings_visible = False
         self._last_log = ""
+        self._history_dialog: HistoryDialog | None = None
+        self._memory_dialog: MemoryDialog | None = None
+        self._last_audio_refresh_request = 0.0
+        self._last_system_audio_signature = None
         self.settings = load_visual_settings()
         self.analyzer = AudioReactiveAnalyzer(
             sensitivity=self.settings.microphone_sensitivity
@@ -258,6 +754,9 @@ class LiquidMainWindow(QMainWindow):
 
         self.settings_panel = VisualSettingsPanel(self.settings)
         self.settings_panel.changed.connect(self._apply_visual_settings)
+        self.settings_panel.audio_devices_changed.connect(self._audio_devices_selected)
+        self.settings_panel.history_requested.connect(self.show_history)
+        self.settings_panel.memory_requested.connect(self.show_memory)
         self.settings_panel.hide()
         self.root_layout.addWidget(self.settings_panel, 0, Qt.AlignmentFlag.AlignHCenter)
 
@@ -275,9 +774,31 @@ class LiquidMainWindow(QMainWindow):
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(350)
         self._save_timer.timeout.connect(lambda: save_visual_settings(self.settings))
+        self._audio_change_debounce = QTimer(self)
+        self._audio_change_debounce.setSingleShot(True)
+        self._audio_change_debounce.setInterval(350)
+        self._audio_change_debounce.timeout.connect(self.request_audio_backend_refresh)
+        self._audio_watch_timer = QTimer(self)
+        self._audio_watch_timer.setInterval(3000)
+        self._audio_watch_timer.timeout.connect(self._poll_system_audio_devices)
+        self._media_devices = None
+        if QMediaDevices is not None:
+            try:
+                self._media_devices = QMediaDevices(self)
+                self._media_devices.audioInputsChanged.connect(
+                    self._audio_change_debounce.start
+                )
+                self._media_devices.audioOutputsChanged.connect(
+                    self._audio_change_debounce.start
+                )
+                self._last_system_audio_signature = self._system_audio_signature()
+                self._audio_watch_timer.start()
+            except Exception:
+                self._media_devices = None
 
         self.state_signal.connect(self._apply_state)
         self.log_signal.connect(self._receive_log)
+        self.audio_refresh_signal.connect(self.settings_panel.refresh_audio_devices)
         self._configure_shortcuts()
         self._apply_visual_settings(self.settings, save=False)
         QTimer.singleShot(0, self._center_on_screen)
@@ -497,8 +1018,64 @@ class LiquidMainWindow(QMainWindow):
 
     def _receive_log(self, text: str) -> None:
         self._last_log = str(text)
+        append_history(self._last_log)
         if self._last_log.startswith("ERR:"):
             self._apply_state(AssistantState.ERROR.value)
+
+    @staticmethod
+    def _system_audio_signature():
+        if QMediaDevices is None:
+            return None
+        try:
+            inputs = tuple(
+                sorted((bytes(item.id()), item.description()) for item in QMediaDevices.audioInputs())
+            )
+            outputs = tuple(
+                sorted((bytes(item.id()), item.description()) for item in QMediaDevices.audioOutputs())
+            )
+            return inputs, outputs
+        except Exception:
+            return None
+
+    def _poll_system_audio_devices(self) -> None:
+        signature = self._system_audio_signature()
+        if signature is None:
+            return
+        if self._last_system_audio_signature is None:
+            self._last_system_audio_signature = signature
+            return
+        if signature != self._last_system_audio_signature:
+            self._last_system_audio_signature = signature
+            self._audio_change_debounce.start()
+
+    def request_audio_backend_refresh(self) -> None:
+        now = time.monotonic()
+        if now - self._last_audio_refresh_request < 0.75:
+            return
+        self._last_audio_refresh_request = now
+        if self.on_audio_refresh_requested:
+            self.on_audio_refresh_requested()
+        else:
+            self.settings_panel.refresh_audio_devices()
+
+    def refresh_audio_devices(self) -> None:
+        self.audio_refresh_signal.emit()
+
+    def show_history(self) -> None:
+        if self._history_dialog is None:
+            self._history_dialog = HistoryDialog(self)
+        self._history_dialog.refresh()
+        self._history_dialog.show()
+        self._history_dialog.raise_()
+        self._history_dialog.activateWindow()
+
+    def show_memory(self) -> None:
+        if self._memory_dialog is None:
+            self._memory_dialog = MemoryDialog(self)
+        self._memory_dialog.refresh()
+        self._memory_dialog.show()
+        self._memory_dialog.raise_()
+        self._memory_dialog.activateWindow()
 
     def _on_shader_failure(self, error: str) -> None:
         self._last_log = f"Renderizador simplificado: {error}"
@@ -549,9 +1126,16 @@ class LiquidMainWindow(QMainWindow):
 
     def toggle_settings(self) -> None:
         self._settings_visible = not self._settings_visible
+        if self._settings_visible:
+            self.settings_panel.refresh_audio_devices()
+            self.request_audio_backend_refresh()
         self.settings_panel.setVisible(self._settings_visible)
         self._resize_for_contents()
         self._arm_auto_hide()
+
+    def _audio_devices_selected(self, input_device, output_device) -> None:
+        if self.on_audio_devices_changed:
+            self.on_audio_devices_changed(input_device, output_device)
 
     def _apply_visual_settings(
         self, settings: VisualSettings, save: bool = True
@@ -648,6 +1232,30 @@ class LiquidJarvisUI:
     @on_manual_activate.setter
     def on_manual_activate(self, callback) -> None:
         self._win.on_manual_activate = callback
+
+    @property
+    def on_audio_devices_changed(self):
+        return self._win.on_audio_devices_changed
+
+    @on_audio_devices_changed.setter
+    def on_audio_devices_changed(self, callback) -> None:
+        self._win.on_audio_devices_changed = callback
+
+    @property
+    def on_audio_refresh_requested(self):
+        return self._win.on_audio_refresh_requested
+
+    @on_audio_refresh_requested.setter
+    def on_audio_refresh_requested(self, callback) -> None:
+        self._win.on_audio_refresh_requested = callback
+        if callback is not None:
+            QTimer.singleShot(0, self._win.request_audio_backend_refresh)
+
+    def refresh_audio_devices(self) -> None:
+        try:
+            self._win.audio_refresh_signal.emit()
+        except RuntimeError:
+            return
 
     def set_state(self, state: str) -> None:
         try:

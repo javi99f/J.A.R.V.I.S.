@@ -13,6 +13,9 @@ config/*.local.json
 !config/*.example.json
 
 memory/*.json
+memory/*.db
+memory/*.db-wal
+memory/*.db-shm
 runtime/*.json
 
 __pycache__/
@@ -31,6 +34,7 @@ dist-release/
 outputs/
 .updates/
 inno-setup.exe
+.inno-compiler/
 
 jarvis.log
 jarvis.pid

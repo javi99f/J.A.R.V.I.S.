@@ -33,6 +33,17 @@ class _LogStream:
 
 
 def main() -> None:
+    if "--self-test" in sys.argv:
+        output_argument = next(
+            (value.split("=", 1)[1] for value in sys.argv if value.startswith("--self-test-output=")),
+            "",
+        )
+        output_path = Path(output_argument) if output_argument else _data_dir() / "self-test.json"
+        from omar_ai_core.self_test import run_self_test
+
+        report = run_self_test(output_path, include_audio="--self-test-no-audio" not in sys.argv)
+        raise SystemExit(0 if report["ok"] else 2)
+
     log_path = _data_dir() / "jarvis.log"
     if getattr(sys, "frozen", False):
         sys.stdout = _LogStream(log_path)
@@ -50,4 +61,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

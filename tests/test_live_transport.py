@@ -16,6 +16,20 @@ class _DummyWebSocket:
 
 
 class LiveTransportTests(unittest.IsolatedAsyncioTestCase):
+    def test_transient_exception_group_is_unwrapped(self):
+        error = ExceptionGroup(
+            "live tasks",
+            [TimeoutError("opening handshake"), OSError("connection reset")],
+        )
+        self.assertTrue(runtime._is_transient_live_error(error))
+        summary = runtime._live_error_summary(error)
+        self.assertIn("TimeoutError", summary)
+        self.assertIn("connection reset", summary)
+
+    def test_programming_errors_are_not_treated_as_network_interruptions(self):
+        error = ExceptionGroup("live tasks", [ValueError("invalid response shape")])
+        self.assertFalse(runtime._is_transient_live_error(error))
+
     async def _run_wrapper(self, fake_connect, environment):
         original_connect = live_module.ws_connect
         websocket = None

@@ -31,6 +31,8 @@ KEY_ALIASES = {
     "VOICE_RMS_THRESHOLD": "voice_rms_threshold",
     "INPUT_DEVICE": "input_device",
     "OUTPUT_DEVICE": "output_device",
+    "INPUT_DEVICE_NAME": "input_device_name",
+    "OUTPUT_DEVICE_NAME": "output_device_name",
     "BLUETOOTH_SPEAKER_MAC": "bluetooth_speaker_mac",
     "APP_MODE": "app_mode",
     "LIVE_OPEN_TIMEOUT_SECONDS": "live_open_timeout_seconds",
@@ -41,6 +43,7 @@ KEY_ALIASES = {
     "DISPLAY_RESOLUTION": "display_resolution",
     "UPDATE_REPOSITORY": "update_repository",
     "UPDATE_ALLOW_PRERELEASE": "update_allow_prerelease",
+    "THINKING_LEVEL": "thinking_level",
 }
 
 
@@ -102,7 +105,7 @@ def require_secret(name: str) -> str:
 
 
 def write_env(gemini_api_key: str, openrouter_api_key: str, zernio_api_key: str = "") -> None:
-    existing = _parse_env_file()
+    existing = _parse_env_file(ENV_FILE)
     lines = [
         f"GEMINI_API_KEY={gemini_api_key.strip()}",
         f"OPENROUTER_API_KEY={openrouter_api_key.strip()}",
@@ -115,14 +118,54 @@ def write_env(gemini_api_key: str, openrouter_api_key: str, zernio_api_key: str 
     for key in (
         "HOME_ASSISTANT_URL", "HOME_ASSISTANT_TOKEN", "WAKE_MODE", "WAKE_THRESHOLD",
         "CONVERSATION_TIMEOUT_SECONDS", "VOICE_RMS_THRESHOLD", "INPUT_DEVICE",
-        "OUTPUT_DEVICE", "BLUETOOTH_SPEAKER_MAC",
+        "OUTPUT_DEVICE", "INPUT_DEVICE_NAME", "OUTPUT_DEVICE_NAME",
+        "BLUETOOTH_SPEAKER_MAC",
         "APP_MODE", "LIVE_OPEN_TIMEOUT_SECONDS", "LIVE_IP_MODE",
         "LIVE_FORCE_IPV4", "LIVE_USE_SYSTEM_PROXY", "DISPLAY_ROTATION",
         "DISPLAY_RESOLUTION", "UPDATE_REPOSITORY", "UPDATE_ALLOW_PRERELEASE",
+        "THINKING_LEVEL",
     ):
         if existing.get(key):
             lines.append(f"{key}={existing[key]}")
     ENV_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_audio_devices(
+    input_device: int | None,
+    output_device: int | None,
+    input_name: str | None = None,
+    output_name: str | None = None,
+) -> None:
+    """Persist endpoint indexes and stable display names without losing settings.
+
+    PortAudio indexes can change after a reboot or a hot-plug event.  The names
+    let the desktop UI remap a saved selection before the runtime opens audio.
+    ``None`` for a name preserves a legacy stored name; an empty name removes it.
+    """
+    existing = _parse_env_file(ENV_FILE)
+    updates = (
+        ("INPUT_DEVICE", "INPUT_DEVICE_NAME", input_device, input_name),
+        ("OUTPUT_DEVICE", "OUTPUT_DEVICE_NAME", output_device, output_name),
+    )
+    for id_key, name_key, device, stable_name in updates:
+        if device is None:
+            existing.pop(id_key, None)
+            existing.pop(name_key, None)
+            continue
+        existing[id_key] = str(int(device))
+        if stable_name is not None:
+            stable_name = str(stable_name).strip()
+            if stable_name:
+                existing[name_key] = stable_name
+            else:
+                existing.pop(name_key, None)
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ENV_FILE.with_suffix(ENV_FILE.suffix + ".tmp")
+    temporary.write_text(
+        "\n".join(f"{key}={value}" for key, value in existing.items()) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, ENV_FILE)
 
 
 def is_configured() -> bool:
