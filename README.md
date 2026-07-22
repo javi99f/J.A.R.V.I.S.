@@ -34,6 +34,7 @@ See `DESKTOP_WINDOWS.md` for installation, privacy boundaries and diagnostics.
 - SQLite long-term memory with relevance retrieval, legacy JSON migration, secret filtering, and user controls to search, edit, and delete memories
 - Native Windows installer with bundled dependencies and a packaged self-test
 - Safe Windows browser/application interaction with local confirmation for consequential actions
+- Local password-protected developer mode with redacted diagnostics, wake telemetry, personality/voice controls, and a tamper-evident audit
 
 ## Hardware You Need
 
@@ -225,7 +226,7 @@ sudo reboot
 
 ## Remote Updates
 
-Version 0.5.1 can check and install Raspberry Pi updates published through a
+Version 0.5.2 can check and install Raspberry Pi updates published through a
 public GitHub repository. Configure the repository in `.env`:
 
 ```env
@@ -250,6 +251,7 @@ memory, visual settings, and audio configuration are preserved. See
 - `omar_ai_core/state/listening.py` - shared listening mute state for voice and SSH control
 - `omar_ai_core/memory/` - SQLite long-term memory, relevance retrieval, migration, and privacy filtering
 - `omar_ai_core/planning.py` - persistent, verifiable multi-step task plans
+- `omar_ai_core/developer.py` - local developer authorization, redacted diagnostics, personality/voice settings, and hash-chained audit
 - `omar_ai_core/self_test.py` - packaged offline checks for wake word, audio, memory, planning, UI, and runtime tools
 - `omar_ai_core/persona/system_prompt.txt` - assistant behavior prompt
 - `assistantctl` - SSH command-line listening mute control

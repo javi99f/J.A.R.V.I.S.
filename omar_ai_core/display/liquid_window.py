@@ -61,6 +61,12 @@ from omar_ai_core.settings import (
     write_env,
 )
 from omar_ai_core.history import append_history, read_diagnostics, read_history
+from omar_ai_core.developer import (
+    SUPPORTED_VOICES,
+    configured_voice,
+    read_developer_audit,
+    read_personality_style,
+)
 from omar_ai_core.memory.store import clear_memories, delete_memory, list_memories, remember
 
 from .assistant_state import AssistantState, normalize_state, state_label
@@ -234,8 +240,12 @@ class HistoryDialog(QDialog):
         self.diagnostics = QPlainTextEdit()
         self.diagnostics.setReadOnly(True)
         self.diagnostics.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.developer_audit = QPlainTextEdit()
+        self.developer_audit.setReadOnly(True)
+        self.developer_audit.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         tabs.addTab(self.conversation, "CONVERSACIÓN")
         tabs.addTab(self.diagnostics, "ERRORES")
+        tabs.addTab(self.developer_audit, "DESARROLLADOR")
         root.addWidget(tabs, 1)
 
         actions = QHBoxLayout()
@@ -252,10 +262,111 @@ class HistoryDialog(QDialog):
     def refresh(self) -> None:
         history = read_history() or "Todavía no hay conversaciones registradas."
         diagnostics = read_diagnostics() or "No hay errores registrados."
+        developer_audit = read_developer_audit() or "No hay acciones de desarrollador registradas."
         self.conversation.setPlainText(history)
         self.diagnostics.setPlainText(diagnostics)
+        self.developer_audit.setPlainText(developer_audit)
         self.conversation.moveCursor(self.conversation.textCursor().MoveOperation.End)
         self.diagnostics.moveCursor(self.diagnostics.textCursor().MoveOperation.End)
+        self.developer_audit.moveCursor(self.developer_audit.textCursor().MoveOperation.End)
+
+
+class DeveloperDialog(QDialog):
+    activate_requested = pyqtSignal()
+    disable_requested = pyqtSignal()
+    settings_requested = pyqtSignal(str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Modo desarrollador de Jarvis")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.resize(620, 430)
+        self.setMinimumSize(520, 360)
+        self.setStyleSheet(
+            """
+            QDialog { background: #100c0e; color: #f6e3e6; }
+            QLabel { color: #f6e3e6; }
+            QPlainTextEdit, QComboBox {
+                color: #f3e5e7; background: #171315;
+                border: 1px solid rgba(232,154,36,105); border-radius: 7px;
+                padding: 6px;
+            }
+            QPushButton {
+                color: #f6e3e6; background: rgba(255,255,255,12);
+                border: 1px solid rgba(232,154,36,105); border-radius: 8px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover { background: rgba(232,154,36,40); }
+            QPushButton:disabled { color: #75666a; border-color: #4a3830; }
+            """
+        )
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(9)
+
+        self.status = QLabel("BLOQUEADO · activa el modo y escribe la contraseña local")
+        self.status.setFont(QFont("Segoe UI", 10, QFont.Weight.DemiBold))
+        root.addWidget(self.status)
+        explanation = QLabel(
+            "Permite analizar diagnósticos y cambiar la personalidad o la voz. "
+            "No permite editar código ni ejecutar comandos del sistema."
+        )
+        explanation.setWordWrap(True)
+        root.addWidget(explanation)
+
+        root.addWidget(QLabel("Personalidad y forma de responder"))
+        self.personality = QPlainTextEdit()
+        self.personality.setPlaceholderText(
+            "Ejemplo: habla con calma, sé directo y utiliza respuestas breves."
+        )
+        self.personality.setPlainText(read_personality_style())
+        root.addWidget(self.personality, 1)
+
+        voice_row = QHBoxLayout()
+        voice_row.addWidget(QLabel("Voz"))
+        self.voice = QComboBox()
+        self.voice.addItems(SUPPORTED_VOICES)
+        self.voice.setCurrentText(configured_voice())
+        voice_row.addWidget(self.voice, 1)
+        root.addLayout(voice_row)
+
+        actions = QHBoxLayout()
+        self.activate_button = QPushButton("ACTIVAR")
+        self.activate_button.clicked.connect(self.activate_requested.emit)
+        self.disable_button = QPushButton("BLOQUEAR")
+        self.disable_button.clicked.connect(self.disable_requested.emit)
+        self.save_button = QPushButton("GUARDAR CAMBIOS")
+        self.save_button.clicked.connect(
+            lambda: self.settings_requested.emit(
+                self.personality.toPlainText(), self.voice.currentText()
+            )
+        )
+        close = QPushButton("CERRAR")
+        close.clicked.connect(self.close)
+        actions.addWidget(self.activate_button)
+        actions.addWidget(self.disable_button)
+        actions.addStretch()
+        actions.addWidget(self.save_button)
+        actions.addWidget(close)
+        root.addLayout(actions)
+        self.set_unlocked(False, 0)
+
+    def refresh_values(self) -> None:
+        self.personality.setPlainText(read_personality_style())
+        self.voice.setCurrentText(configured_voice())
+
+    def set_unlocked(self, active: bool, remaining_seconds: int = 0) -> None:
+        active = bool(active)
+        if active:
+            minutes = max(1, int(remaining_seconds) // 60)
+            self.status.setText(f"ACTIVO · aproximadamente {minutes} min restantes")
+        else:
+            self.status.setText("BLOQUEADO · activa el modo y escribe la contraseña local")
+        self.personality.setEnabled(active)
+        self.voice.setEnabled(active)
+        self.save_button.setEnabled(active)
+        self.disable_button.setEnabled(active)
+        self.activate_button.setEnabled(not active)
 
 
 class MemoryDialog(QDialog):
@@ -448,6 +559,7 @@ class VisualSettingsPanel(QFrame):
     audio_devices_changed = pyqtSignal(object, object)
     history_requested = pyqtSignal()
     memory_requested = pyqtSignal()
+    developer_requested = pyqtSignal()
 
     def __init__(self, settings: VisualSettings, parent=None):
         super().__init__(parent)
@@ -536,6 +648,19 @@ class VisualSettingsPanel(QFrame):
         self.output_device_combo = self._audio_device_row(root, "Salida de audio")
         self.refresh_audio_devices()
 
+        developer_row = QHBoxLayout()
+        self.wake_status = self._small_label("Hey Jarvis: iniciando detector…")
+        self.wake_status.setToolTip("Diagnóstico local del detector de la frase de activación")
+        developer_row.addWidget(self.wake_status, 1)
+        self.developer_button = QPushButton("DESARROLLADOR")
+        self.developer_button.setObjectName("historyButton")
+        self.developer_button.setFixedHeight(24)
+        self.developer_button.setToolTip(
+            "Diagnósticos, auditoría, personalidad y voz con contraseña local"
+        )
+        developer_row.addWidget(self.developer_button)
+        root.addLayout(developer_row)
+
         switches = QHBoxLayout()
         self.computer_control = QCheckBox("Control del PC")
         self.computer_control.setChecked(settings.computer_control_enabled)
@@ -558,8 +683,26 @@ class VisualSettingsPanel(QFrame):
         self.output_device_combo.currentIndexChanged.connect(self._publish_audio_devices)
         self.history_button.clicked.connect(self.history_requested.emit)
         self.memory_button.clicked.connect(self.memory_requested.emit)
+        self.developer_button.clicked.connect(self.developer_requested.emit)
         self.computer_control.toggled.connect(self._publish)
         self.reduced.toggled.connect(self._publish)
+
+    def set_wake_status(self, snapshot: dict) -> None:
+        snapshot = dict(snapshot or {})
+        available = bool(snapshot.get("available"))
+        mode = str(snapshot.get("mode") or "wakeword")
+        if mode != "wakeword":
+            summary = f"Hey Jarvis: modo {mode}"
+        elif not available:
+            summary = "Hey Jarvis: detector no disponible"
+        else:
+            score = float(snapshot.get("last_score") or 0.0)
+            threshold = float(snapshot.get("threshold") or 0.0)
+            rms = float(snapshot.get("last_rms") or 0.0)
+            summary = f"Hey Jarvis: {score:.2f}/{threshold:.2f} · micro {rms:.0f}"
+        self.wake_status.setText(summary)
+        details = "\n".join(f"{key}: {value}" for key, value in snapshot.items())
+        self.wake_status.setToolTip(details or "Sin telemetría disponible")
 
     @staticmethod
     def _small_label(text: str) -> QLabel:
@@ -699,6 +842,9 @@ class LiquidMainWindow(QMainWindow):
     state_signal = pyqtSignal(str)
     log_signal = pyqtSignal(str)
     audio_refresh_signal = pyqtSignal()
+    wake_status_signal = pyqtSignal(object)
+    developer_status_signal = pyqtSignal(bool, int)
+    developer_password_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -717,6 +863,9 @@ class LiquidMainWindow(QMainWindow):
         self.on_manual_activate = None
         self.on_audio_devices_changed = None
         self.on_audio_refresh_requested = None
+        self.on_persona_settings_changed = None
+        self.on_developer_activate_requested = None
+        self.on_developer_disable_requested = None
         self._muted = False
         self._current_file: str | None = None
         self._ready = is_configured()
@@ -726,6 +875,9 @@ class LiquidMainWindow(QMainWindow):
         self._last_log = ""
         self._history_dialog: HistoryDialog | None = None
         self._memory_dialog: MemoryDialog | None = None
+        self._developer_dialog: DeveloperDialog | None = None
+        self._developer_unlocked = False
+        self._developer_remaining_seconds = 0
         self._last_audio_refresh_request = 0.0
         self._last_system_audio_signature = None
         self.settings = load_visual_settings()
@@ -757,6 +909,7 @@ class LiquidMainWindow(QMainWindow):
         self.settings_panel.audio_devices_changed.connect(self._audio_devices_selected)
         self.settings_panel.history_requested.connect(self.show_history)
         self.settings_panel.memory_requested.connect(self.show_memory)
+        self.settings_panel.developer_requested.connect(self.show_developer)
         self.settings_panel.hide()
         self.root_layout.addWidget(self.settings_panel, 0, Qt.AlignmentFlag.AlignHCenter)
 
@@ -799,6 +952,9 @@ class LiquidMainWindow(QMainWindow):
         self.state_signal.connect(self._apply_state)
         self.log_signal.connect(self._receive_log)
         self.audio_refresh_signal.connect(self.settings_panel.refresh_audio_devices)
+        self.wake_status_signal.connect(self.settings_panel.set_wake_status)
+        self.developer_status_signal.connect(self._apply_developer_status)
+        self.developer_password_signal.connect(self._show_developer_password)
         self._configure_shortcuts()
         self._apply_visual_settings(self.settings, save=False)
         QTimer.singleShot(0, self._center_on_screen)
@@ -1077,6 +1233,77 @@ class LiquidMainWindow(QMainWindow):
         self._memory_dialog.raise_()
         self._memory_dialog.activateWindow()
 
+    def show_developer(self) -> None:
+        if self._developer_dialog is None:
+            self._developer_dialog = DeveloperDialog(self)
+            self._developer_dialog.activate_requested.connect(
+                self._activate_developer_requested
+            )
+            self._developer_dialog.disable_requested.connect(
+                self._disable_developer_requested
+            )
+            self._developer_dialog.settings_requested.connect(
+                self._persona_settings_selected
+            )
+        self._developer_dialog.refresh_values()
+        self._developer_dialog.set_unlocked(
+            self._developer_unlocked, self._developer_remaining_seconds
+        )
+        self._developer_dialog.show()
+        self._developer_dialog.raise_()
+        self._developer_dialog.activateWindow()
+
+    def _activate_developer_requested(self) -> None:
+        if self.on_developer_activate_requested:
+            threading.Thread(
+                target=self.on_developer_activate_requested, daemon=True
+            ).start()
+
+    def _disable_developer_requested(self) -> None:
+        if self.on_developer_disable_requested:
+            threading.Thread(
+                target=self.on_developer_disable_requested, daemon=True
+            ).start()
+
+    def _persona_settings_selected(self, personality: str, voice: str) -> None:
+        if self.on_persona_settings_changed:
+            threading.Thread(
+                target=self.on_persona_settings_changed,
+                args=(personality, voice),
+                daemon=True,
+            ).start()
+
+    def _apply_developer_status(self, active: bool, remaining_seconds: int) -> None:
+        self._developer_unlocked = bool(active)
+        self._developer_remaining_seconds = max(0, int(remaining_seconds))
+        self.settings_panel.developer_button.setText(
+            "DEV ACTIVO" if self._developer_unlocked else "DESARROLLADOR"
+        )
+        if self._developer_dialog is not None:
+            self._developer_dialog.set_unlocked(
+                self._developer_unlocked, self._developer_remaining_seconds
+            )
+
+    def _show_developer_password(self, request: dict) -> None:
+        try:
+            password, accepted = QInputDialog.getText(
+                self,
+                "Activar modo desarrollador",
+                "Contraseña local (no se enviará a Gemini):",
+                QLineEdit.EchoMode.Password,
+                "",
+            )
+            request["result"] = password if accepted else None
+        finally:
+            request["event"].set()
+
+    def request_developer_password(self) -> str | None:
+        request = {"event": threading.Event(), "result": None}
+        self.developer_password_signal.emit(request)
+        if not request["event"].wait(timeout=120):
+            return None
+        return request["result"]
+
     def _on_shader_failure(self, error: str) -> None:
         self._last_log = f"Renderizador simplificado: {error}"
 
@@ -1250,6 +1477,49 @@ class LiquidJarvisUI:
         self._win.on_audio_refresh_requested = callback
         if callback is not None:
             QTimer.singleShot(0, self._win.request_audio_backend_refresh)
+
+    @property
+    def on_persona_settings_changed(self):
+        return self._win.on_persona_settings_changed
+
+    @on_persona_settings_changed.setter
+    def on_persona_settings_changed(self, callback) -> None:
+        self._win.on_persona_settings_changed = callback
+
+    @property
+    def on_developer_activate_requested(self):
+        return self._win.on_developer_activate_requested
+
+    @on_developer_activate_requested.setter
+    def on_developer_activate_requested(self, callback) -> None:
+        self._win.on_developer_activate_requested = callback
+
+    @property
+    def on_developer_disable_requested(self):
+        return self._win.on_developer_disable_requested
+
+    @on_developer_disable_requested.setter
+    def on_developer_disable_requested(self, callback) -> None:
+        self._win.on_developer_disable_requested = callback
+
+    def request_developer_password(self) -> str | None:
+        return self._win.request_developer_password()
+
+    def set_developer_unlocked(
+        self, active: bool, remaining_seconds: int = 0
+    ) -> None:
+        try:
+            self._win.developer_status_signal.emit(
+                bool(active), max(0, int(remaining_seconds))
+            )
+        except RuntimeError:
+            return
+
+    def set_wake_status(self, snapshot: dict) -> None:
+        try:
+            self._win.wake_status_signal.emit(dict(snapshot or {}))
+        except RuntimeError:
+            return
 
     def refresh_audio_devices(self) -> None:
         try:

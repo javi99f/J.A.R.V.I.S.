@@ -27,8 +27,13 @@ KEY_ALIASES = {
     "OS_SYSTEM": "os_system",
     "WAKE_MODE": "wake_mode",
     "WAKE_THRESHOLD": "wake_threshold",
+    "WAKE_CONFIRM_FRAMES": "wake_confirm_frames",
+    "WAKE_VAD_THRESHOLD": "wake_vad_threshold",
+    "WAKE_AUTO_GAIN": "wake_auto_gain",
     "CONVERSATION_TIMEOUT_SECONDS": "conversation_timeout_seconds",
     "VOICE_RMS_THRESHOLD": "voice_rms_threshold",
+    "JARVIS_VOICE": "jarvis_voice",
+    "DEVELOPER_PASSWORD_SHA256": "developer_password_sha256",
     "INPUT_DEVICE": "input_device",
     "OUTPUT_DEVICE": "output_device",
     "INPUT_DEVICE_NAME": "input_device_name",
@@ -117,7 +122,9 @@ def write_env(gemini_api_key: str, openrouter_api_key: str, zernio_api_key: str 
 
     for key in (
         "HOME_ASSISTANT_URL", "HOME_ASSISTANT_TOKEN", "WAKE_MODE", "WAKE_THRESHOLD",
-        "CONVERSATION_TIMEOUT_SECONDS", "VOICE_RMS_THRESHOLD", "INPUT_DEVICE",
+        "WAKE_CONFIRM_FRAMES", "WAKE_VAD_THRESHOLD", "WAKE_AUTO_GAIN",
+        "CONVERSATION_TIMEOUT_SECONDS", "VOICE_RMS_THRESHOLD", "JARVIS_VOICE",
+        "DEVELOPER_PASSWORD_SHA256", "INPUT_DEVICE",
         "OUTPUT_DEVICE", "INPUT_DEVICE_NAME", "OUTPUT_DEVICE_NAME",
         "BLUETOOTH_SPEAKER_MAC",
         "APP_MODE", "LIVE_OPEN_TIMEOUT_SECONDS", "LIVE_IP_MODE",
@@ -159,6 +166,29 @@ def write_audio_devices(
                 existing[name_key] = stable_name
             else:
                 existing.pop(name_key, None)
+    ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    temporary = ENV_FILE.with_suffix(ENV_FILE.suffix + ".tmp")
+    temporary.write_text(
+        "\n".join(f"{key}={value}" for key, value in existing.items()) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, ENV_FILE)
+
+
+def write_runtime_settings(updates: dict[str, str | int | float | None]) -> None:
+    """Atomically update approved runtime settings without losing secrets."""
+    existing = _parse_env_file(ENV_FILE)
+    for key, raw_value in updates.items():
+        key = str(key or "").strip().upper()
+        if not key or key not in KEY_ALIASES:
+            raise ValueError(f"Unsupported setting: {key}")
+        value = "" if raw_value is None else str(raw_value).strip()
+        if value:
+            if "\n" in value or "\r" in value:
+                raise ValueError(f"Setting {key} must be a single line")
+            existing[key] = value
+        else:
+            existing.pop(key, None)
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary = ENV_FILE.with_suffix(ENV_FILE.suffix + ".tmp")
     temporary.write_text(

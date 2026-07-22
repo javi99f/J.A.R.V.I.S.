@@ -31,7 +31,10 @@ Configuración inicial recomendada:
 
 ```dotenv
 WAKE_MODE=wakeword
-WAKE_THRESHOLD=0.55
+WAKE_THRESHOLD=0.40
+WAKE_CONFIRM_FRAMES=2
+WAKE_VAD_THRESHOLD=0
+WAKE_AUTO_GAIN=1
 CONVERSATION_TIMEOUT_SECONDS=12
 VOICE_RMS_THRESHOLD=300
 ```
@@ -110,4 +113,3 @@ pactl list short sinks
 ```
 
 No compartas el archivo `.env`, ya que contiene claves privadas.
-

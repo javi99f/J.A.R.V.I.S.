@@ -17,7 +17,9 @@ class ReasoningConfigurationTests(unittest.TestCase):
 
     def test_planning_and_memory_tools_are_exposed(self):
         names = {item["name"] for item in runtime.TOOL_DECLARATIONS}
-        self.assertTrue({"task_plan", "recall_memory", "forget_memory"}.issubset(names))
+        self.assertTrue(
+            {"task_plan", "recall_memory", "forget_memory", "developer_mode"}.issubset(names)
+        )
 
 
 if __name__ == "__main__":

@@ -76,7 +76,9 @@ def run_self_test(output_path: Path, *, include_audio: bool = True) -> dict:
         from omar_ai_core import runtime
 
         names = {item["name"] for item in runtime.TOOL_DECLARATIONS}
-        required = {"computer_control", "task_plan", "save_memory", "recall_memory"}
+        required = {
+            "computer_control", "task_plan", "save_memory", "recall_memory", "developer_mode"
+        }
         missing = sorted(required - names)
         if missing:
             raise RuntimeError(f"missing tools: {', '.join(missing)}")
@@ -86,9 +88,17 @@ def run_self_test(output_path: Path, *, include_audio: bool = True) -> dict:
         return {"thinking_level": level.value, "tools": len(names)}
 
     def check_ui():
-        from omar_ai_core.display.liquid_window import MemoryDialog, VisualSettingsPanel
+        from omar_ai_core.display.liquid_window import (
+            DeveloperDialog,
+            MemoryDialog,
+            VisualSettingsPanel,
+        )
 
-        return {"memory_dialog": MemoryDialog.__name__, "settings": VisualSettingsPanel.__name__}
+        return {
+            "developer_dialog": DeveloperDialog.__name__,
+            "memory_dialog": MemoryDialog.__name__,
+            "settings": VisualSettingsPanel.__name__,
+        }
 
     def check_audio():
         import sounddevice as sd

@@ -50,6 +50,20 @@ class SettingsTests(unittest.TestCase):
                 self.assertEqual(saved["OUTPUT_DEVICE"], "11")
                 self.assertEqual(saved["OUTPUT_DEVICE_NAME"], "USB Speakers")
 
+    def test_runtime_setting_update_preserves_api_and_audio_configuration(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / ".env"
+            path.write_text(
+                "GEMINI_API_KEY=test-key\nINPUT_DEVICE=7\n",
+                encoding="utf-8",
+            )
+            with patch.object(settings, "ENV_FILE", path):
+                settings.write_runtime_settings({"JARVIS_VOICE": "Kore"})
+                saved = settings._parse_env_file(path)
+            self.assertEqual(saved["GEMINI_API_KEY"], "test-key")
+            self.assertEqual(saved["INPUT_DEVICE"], "7")
+            self.assertEqual(saved["JARVIS_VOICE"], "Kore")
+
 
 if __name__ == "__main__":
     unittest.main()
