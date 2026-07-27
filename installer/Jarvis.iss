@@ -1,5 +1,5 @@
 #define MyAppName "Jarvis"
-#define MyAppVersion "0.5.2"
+#define MyAppVersion "0.1.0"
 #define MyAppPublisher "Personal AI Lab"
 #define MyAppExeName "Jarvis.exe"
 
@@ -16,13 +16,16 @@ OutputDir=..\dist-installer
 OutputBaseFilename=Jarvis-Setup
 SetupIconFile=..\assets\jarvis.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-Compression=lzma2/max
-SolidCompression=yes
+Compression=zip
+SolidCompression=no
 WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
-RestartApplications=no
+RestartApplications=yes
+VersionInfoVersion={#MyAppVersion}.0
+VersionInfoProductVersion={#MyAppVersion}.0
+VersionInfoDescription=Jarvis Windows
 
 [Languages]
 Name: "spanish"; MessagesFile: "compiler:Languages\Spanish.isl"
