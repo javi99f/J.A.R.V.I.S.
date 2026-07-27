@@ -216,19 +216,31 @@ class UpdateManager:
     def _release_payload(self) -> dict:
         self._validate_repository()
         api_root = f"https://api.github.com/repos/{self.repository}/releases"
-        if not self.allow_prerelease:
-            payload = self._get(f"{api_root}/latest").json()
-            if not isinstance(payload, dict):
-                raise UpdateError("GitHub devolvió una respuesta de versión no válida.")
-            return payload
-
-        payload = self._get(f"{api_root}?per_page=20").json()
+        payload = self._get(f"{api_root}?per_page=50").json()
         if not isinstance(payload, list):
             raise UpdateError("GitHub devolvió una lista de versiones no válida.")
+
+        candidates: list[tuple[tuple, dict]] = []
         for release in payload:
-            if isinstance(release, dict) and not release.get("draft"):
-                return release
-        raise UpdateError("El repositorio todavía no tiene versiones publicadas.")
+            if not isinstance(release, dict) or release.get("draft"):
+                continue
+            if release.get("prerelease") and not self.allow_prerelease:
+                continue
+            tag = str(release.get("tag_name") or "").strip()
+            # Raspberry releases use plain vX.Y.Z tags. Windows releases use
+            # windows-vX.Y.Z and must never become candidates on the Pi.
+            if not re.fullmatch(
+                r"v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?",
+                tag,
+            ):
+                continue
+            try:
+                candidates.append((_version_key(tag), release))
+            except UpdateError:
+                continue
+        if candidates:
+            return max(candidates, key=lambda item: item[0])[1]
+        raise UpdateError("El repositorio todavía no tiene versiones para Raspberry Pi.")
 
     def check_for_updates(self) -> UpdateCheck:
         release_payload = self._release_payload()

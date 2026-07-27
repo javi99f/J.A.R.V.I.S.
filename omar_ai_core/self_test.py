@@ -74,6 +74,7 @@ def run_self_test(output_path: Path, *, include_audio: bool = True) -> dict:
     def check_runtime():
         from google.genai import types
         from omar_ai_core import runtime
+        from omar_ai_core.windows_updater import read_windows_version
 
         names = {item["name"] for item in runtime.TOOL_DECLARATIONS}
         required = {
@@ -85,7 +86,14 @@ def run_self_test(output_path: Path, *, include_audio: bool = True) -> dict:
         level = runtime._configured_thinking_level()
         if level not in {types.ThinkingLevel.MEDIUM, types.ThinkingLevel.HIGH}:
             raise RuntimeError(f"unexpected thinking level: {level}")
-        return {"thinking_level": level.value, "tools": len(names)}
+        windows_version = read_windows_version()
+        if windows_version == "0.0.0":
+            raise RuntimeError("Windows version metadata is missing")
+        return {
+            "thinking_level": level.value,
+            "tools": len(names),
+            "windows_version": windows_version,
+        }
 
     def check_ui():
         from omar_ai_core.display.liquid_window import (

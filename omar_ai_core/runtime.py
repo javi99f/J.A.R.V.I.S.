@@ -42,6 +42,7 @@ from .developer import (
     write_voice,
 )
 from .updater import ReleaseInfo, UpdateManager
+from .windows_updater import WindowsUpdateManager
 
 
 def get_base_dir():
@@ -428,10 +429,11 @@ TOOL_DECLARATIONS = [
     {
         "name": "jarvis_update",
         "description": (
-            "Checks and installs official JARVIS Raspberry Pi updates from the configured GitHub "
-            "repository. Use check when the user asks to search for updates. Use install only when "
-            "the user explicitly confirms installation or clearly commands JARVIS to update itself. "
-            "Never invent an available version and never install without explicit confirmation."
+            "Checks and installs official JARVIS updates for the current Windows or Raspberry Pi "
+            "edition from the configured GitHub repository. Use check when the user asks to search "
+            "for updates. Use install only when the user explicitly confirms installation or clearly "
+            "commands JARVIS to update itself. Never invent a version and never install without "
+            "explicit confirmation."
         ),
         "parameters": {
             "type": "OBJECT",
@@ -640,7 +642,7 @@ TOOL_DECLARATIONS = [
 
 def _available_tool_declarations() -> list[dict]:
     if is_desktop_mode():
-        disabled = {"pi_controls", "social_insights", "jarvis_update"}
+        disabled = {"pi_controls", "social_insights"}
         return [item for item in TOOL_DECLARATIONS if item.get("name") not in disabled]
     return [item for item in TOOL_DECLARATIONS if item.get("name") != "computer_control"]
 
@@ -661,7 +663,7 @@ class JarvisLive:
         self._pre_roll = deque(maxlen=12)
         self.developer = DeveloperMode()
         self.plans = PlanManager()
-        self.updates = UpdateManager()
+        self.updates = WindowsUpdateManager() if is_desktop_mode() else UpdateManager()
         self._pending_update: ReleaseInfo | None = None
         self._restart_requested = False
         self._restart_fallback_started = False
@@ -703,6 +705,8 @@ class JarvisLive:
             self.ui.on_developer_activate_requested = self._on_developer_activate_requested
         if hasattr(self.ui, "on_developer_disable_requested"):
             self.ui.on_developer_disable_requested = self._on_developer_disable_requested
+        if is_desktop_mode() and hasattr(self.ui, "on_update_requested"):
+            self.ui.on_update_requested = self._on_update_requested
         self.ui.muted = listening_state.get_listening_muted(False)
         if self.wake_gate.mode == "wakeword" and not self.wake_gate.available:
             self.ui.write_log(f"ERR: Local wake word unavailable: {self.wake_gate.error}")
@@ -734,6 +738,50 @@ class JarvisLive:
             self.ui.write_log("SYS: Dispositivo de salida actualizado.")
             if self._loop is not None and self.audio_in_queue is not None:
                 self._loop.call_soon_threadsafe(self._request_output_stream_restart)
+
+    def _on_update_requested(self) -> None:
+        """Run the Windows updater without requiring a Gemini connection."""
+        status = getattr(self.ui, "set_update_status", None)
+        confirm = getattr(self.ui, "confirm_update", None)
+        try:
+            if status:
+                status("Buscando actualizaciones…", True)
+            self.ui.write_log("SYS: Buscando actualizaciones de Jarvis Windows en GitHub…")
+            check = self.updates.check_for_updates()
+            if not check.available or check.release is None:
+                message = f"Jarvis Windows v{check.current_version} está actualizado."
+                self.ui.write_log(f"SYS: {message}")
+                if status:
+                    status(message, False)
+                return
+
+            release = check.release
+            if status:
+                status(f"Disponible: v{release.version}", False)
+            approved = bool(confirm and confirm(release.version, release.notes))
+            if not approved:
+                self.ui.write_log("SYS: Actualización cancelada por el usuario.")
+                if status:
+                    status(f"Windows v{check.current_version}", False)
+                return
+
+            if status:
+                status(f"Descargando v{release.version}…", True)
+            self.ui.write_log(
+                f"SYS: Descargando y verificando Jarvis Windows v{release.version}…"
+            )
+            installed = self.updates.install(release)
+            self.ui.write_log(
+                f"SYS: Instalador verificado de v{installed.installed_version} iniciado."
+            )
+            if status:
+                status("Instalando; Jarvis se reiniciará…", True)
+            time.sleep(1.5)
+            os._exit(0)
+        except Exception as exc:
+            self.ui.write_log(f"ERR: Actualización de Windows: {exc}")
+            if status:
+                status("Error; consulta HISTORIAL", False)
 
     def _request_output_stream_restart(self) -> None:
         if self.audio_in_queue is None:
@@ -970,7 +1018,7 @@ class JarvisLive:
         # Exit code 75 is handled by start_jarvis_pi.sh, which keeps the X
         # session alive and starts the newly installed code.
         time.sleep(1.0)
-        os._exit(75)
+        os._exit(0 if is_desktop_mode() else 75)
 
     def _request_restart_after_response(self):
         self._restart_requested = True
@@ -1441,9 +1489,6 @@ class JarvisLive:
                     )
 
             elif name == "jarvis_update":
-                if is_desktop_mode():
-                    result = "Remote self-updates are currently available only on the Raspberry Pi edition."
-                    return types.FunctionResponse(id=fc.id, name=name, response={"result": result})
                 update_action = action or "check"
                 if update_action == "status":
                     status = self.updates.status()
@@ -1476,15 +1521,25 @@ class JarvisLive:
                         if release is None:
                             result = "JARVIS is already up to date; nothing was installed."
                         else:
-                            self.ui.write_log(
-                                f"SYS: Instalando JARVIS {release.version}; no desconectes la alimentación..."
-                            )
+                            if is_desktop_mode():
+                                self.ui.write_log(
+                                    f"SYS: Descargando y verificando JARVIS Windows {release.version}..."
+                                )
+                            else:
+                                self.ui.write_log(
+                                    f"SYS: Instalando JARVIS {release.version}; "
+                                    "no desconectes la alimentación..."
+                                )
                             installed = await loop.run_in_executor(
                                 None, lambda: self.updates.install(release)
                             )
                             self._pending_update = None
                             self._request_restart_after_response()
                             result = (
+                                f"JARVIS {installed.installed_version} was verified and its installer "
+                                "was started. Tell the user it will restart now."
+                                if is_desktop_mode()
+                                else
                                 f"JARVIS {installed.installed_version} was installed and validated. "
                                 "Tell the user it will restart now."
                             )
