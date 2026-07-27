@@ -66,17 +66,17 @@ class UpdaterTests(unittest.TestCase):
                     _safe_relative_name(name)
 
     def test_check_reads_matching_github_release_manifest(self):
-        api = "https://api.github.com/repos/example/Jarvis/releases/latest"
+        api = "https://api.github.com/repos/example/Jarvis/releases?per_page=50"
         manifest_url = "https://github.com/example/Jarvis/releases/download/v0.4.0/jarvis-pi-manifest.json"
         package_url = "https://github.com/example/Jarvis/releases/download/v0.4.0/jarvis-pi-arm64.zip"
-        release_payload = {
+        release_payload = [{
             "tag_name": "v0.4.0",
             "prerelease": False,
             "assets": [
                 {"name": "jarvis-pi-manifest.json", "browser_download_url": manifest_url},
                 {"name": "jarvis-pi-arm64.zip", "browser_download_url": package_url},
             ],
-        }
+        }]
         manifest = {
             "schema_version": 1,
             "version": "0.4.0",
@@ -98,6 +98,46 @@ class UpdaterTests(unittest.TestCase):
         self.assertTrue(result.available)
         self.assertEqual(result.release.version, "0.4.0")
         self.assertEqual(result.release.package_url, package_url)
+
+    def test_pi_check_ignores_newer_windows_channel_release(self):
+        api = "https://api.github.com/repos/example/Jarvis/releases?per_page=50"
+        manifest_url = "https://github.com/example/Jarvis/releases/download/v0.4.0/jarvis-pi-manifest.json"
+        package_url = "https://github.com/example/Jarvis/releases/download/v0.4.0/jarvis-pi-arm64.zip"
+        releases = [
+            {
+                "tag_name": "windows-v9.0.0",
+                "draft": False,
+                "prerelease": False,
+                "assets": [],
+            },
+            {
+                "tag_name": "v0.4.0",
+                "draft": False,
+                "prerelease": False,
+                "assets": [
+                    {"name": "jarvis-pi-manifest.json", "browser_download_url": manifest_url},
+                    {"name": "jarvis-pi-arm64.zip", "browser_download_url": package_url},
+                ],
+            },
+        ]
+        manifest = {
+            "schema_version": 1,
+            "version": "0.4.0",
+            "platform": "linux-aarch64",
+            "package_asset": "jarvis-pi-arm64.zip",
+            "sha256": "a" * 64,
+            "size": 1234,
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "VERSION").write_text("0.3.0\n", encoding="utf-8")
+            manager = UpdateManager(
+                root,
+                repository="example/Jarvis",
+                session=_Session({api: releases, manifest_url: manifest}),
+            )
+            result = manager.check_for_updates()
+        self.assertEqual(result.release.tag, "v0.4.0")
 
     def test_install_preserves_user_data_and_can_roll_back(self):
         with tempfile.TemporaryDirectory() as folder:
