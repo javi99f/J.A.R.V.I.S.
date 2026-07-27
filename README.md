@@ -226,8 +226,11 @@ sudo reboot
 
 ## Remote Updates
 
-Version 0.5.2 can check and install Raspberry Pi updates published through a
-public GitHub repository. Configure the repository in `.env`:
+The Raspberry Pi edition and Windows edition use independent update channels so
+one platform can never install a release built for the other.
+
+The Raspberry Pi edition can check and install `vX.Y.Z` releases published
+through a public GitHub repository. Configure the repository in `.env`:
 
 ```env
 UPDATE_REPOSITORY=javi99f/J.A.R.V.I.S.
@@ -238,6 +241,12 @@ Then type or say "Busca actualizaciones de Jarvis", or press `UPDATE` on the
 Pi interface. Installation always requires explicit confirmation. Local keys,
 memory, visual settings, and audio configuration are preserved. See
 `UPDATES_GITHUB.md` for the publishing and recovery workflow.
+
+Jarvis Windows starts at version **0.1.0** and checks only `windows-vX.Y.Z`
+releases. Open **AJUSTES → ACTUALIZACIONES** to check without a Gemini
+connection. The updater validates the Windows manifest, installer size and
+SHA-256, asks for local confirmation, and then runs the per-user installer.
+Application data remains under `%LOCALAPPDATA%\Jarvis`.
 
 ## Project Layout
 
@@ -257,6 +266,9 @@ memory, visual settings, and audio configuration are preserved. See
 - `assistantctl` - SSH command-line listening mute control
 - `launch_assistant.sh` - Raspberry Pi desktop launch helper
 - `.github/workflows/release-pi.yml` - automatic Raspberry Pi Release packaging
+- `.github/workflows/release-windows.yml` - verified Windows installer release packaging
+- `WINDOWS_VERSION` - independent installed version for the Windows edition
+- `omar_ai_core/windows_updater.py` - Windows release selection, verification, and installer launch
 
 ## Security Before Publishing
 

@@ -19,7 +19,7 @@ La clave, la memoria, el historial y la configuración se guardan únicamente en
 `%LOCALAPPDATA%\Jarvis`, fuera de la carpeta de instalación. OpenRouter no es
 necesario para conversar ni para controlar el ordenador.
 
-## Funciones de la edición Windows 0.5.2
+## Funciones de la edición Windows 0.1.0
 
 - Conversación por Gemini Live, wake word local y órdenes escritas.
 - Orbe nativo transparente y animado, con renderizador simplificado automático
@@ -45,6 +45,25 @@ necesario para conversar ni para controlar el ordenador.
 - No utiliza la cámara ni observa permanentemente el ordenador. Solo captura la
   pantalla cuando necesita ejecutar una orden de control y la opción **Control
   del PC** está activada.
+
+## Actualizaciones de Windows
+
+La edición Windows usa una numeración y un canal independientes de Raspberry
+Pi. Esta instalación es **v0.1.0** y las releases oficiales usan etiquetas
+`windows-v0.1.0`, `windows-v0.1.1`, etc.
+
+Abre **AJUSTES → ACTUALIZACIONES** para buscar una versión. Esta función no
+necesita que Gemini esté conectado. Jarvis:
+
+1. consulta únicamente releases del canal `windows-v…`;
+2. comprueba que el manifiesto sea para Windows de 64 bits;
+3. descarga el instalador a `%LOCALAPPDATA%\Jarvis\.updates\windows`;
+4. verifica su tamaño y SHA-256;
+5. pide confirmación local antes de instalar;
+6. cierra y vuelve a abrir la aplicación mediante el instalador.
+
+Las claves, memoria, historial, dispositivos y ajustes permanecen en
+`%LOCALAPPDATA%\Jarvis`, fuera de la carpeta que reemplaza el instalador.
 
 ## Diagnóstico
 
@@ -80,7 +99,9 @@ una contraseña privada.
 ## Volver a compilar
 
 Ejecuta `build_windows.ps1` desde PowerShell. El script usa
-`.python-build\python.exe`, ejecuta todas las pruebas, reconstruye con
+`.python-build\python.exe` cuando está disponible o el Python activo, ejecuta
+todas las pruebas, reconstruye con
 PyInstaller, ejecuta el autodiagnóstico empaquetado sin depender del hardware de
 audio, crea el instalador con Inno Setup 6 y escribe
-`dist-installer\SHA256SUMS.txt`.
+`dist-installer\SHA256SUMS.txt` y
+`dist-installer\jarvis-windows-manifest.json`.

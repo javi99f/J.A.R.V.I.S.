@@ -4,6 +4,7 @@ from PyInstaller.utils.hooks import collect_data_files
 
 datas = collect_data_files("openwakeword")
 datas += [("omar_ai_core/persona/system_prompt.txt", "omar_ai_core/persona")]
+datas += [("WINDOWS_VERSION", ".")]
 datas += [("assets/jarvis_hud.qml", "assets")]
 datas += [
     ("assets/shaders/ultron_core.vert", "assets/shaders"),
@@ -39,6 +40,7 @@ exe = EXE(
     upx=True,
     console=False,
     icon="assets/jarvis.ico",
+    version="build/windows-version-info.txt",
 )
 
 coll = COLLECT(
