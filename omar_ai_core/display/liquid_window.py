@@ -68,6 +68,7 @@ from omar_ai_core.developer import (
     read_personality_style,
 )
 from omar_ai_core.memory.store import clear_memories, delete_memory, list_memories, remember
+from omar_ai_core.windows_updater import read_windows_version
 
 from .assistant_state import AssistantState, normalize_state, state_label
 from .audio_reactive import AudioReactiveAnalyzer
@@ -560,6 +561,7 @@ class VisualSettingsPanel(QFrame):
     history_requested = pyqtSignal()
     memory_requested = pyqtSignal()
     developer_requested = pyqtSignal()
+    update_requested = pyqtSignal()
 
     def __init__(self, settings: VisualSettings, parent=None):
         super().__init__(parent)
@@ -661,6 +663,20 @@ class VisualSettingsPanel(QFrame):
         developer_row.addWidget(self.developer_button)
         root.addLayout(developer_row)
 
+        update_row = QHBoxLayout()
+        self.version_label = self._small_label(
+            f"Jarvis Windows v{read_windows_version()}"
+        )
+        update_row.addWidget(self.version_label, 1)
+        self.update_button = QPushButton("ACTUALIZACIONES")
+        self.update_button.setObjectName("historyButton")
+        self.update_button.setFixedHeight(24)
+        self.update_button.setToolTip(
+            "Buscar, verificar e instalar una versión oficial de Jarvis Windows"
+        )
+        update_row.addWidget(self.update_button)
+        root.addLayout(update_row)
+
         switches = QHBoxLayout()
         self.computer_control = QCheckBox("Control del PC")
         self.computer_control.setChecked(settings.computer_control_enabled)
@@ -684,6 +700,7 @@ class VisualSettingsPanel(QFrame):
         self.history_button.clicked.connect(self.history_requested.emit)
         self.memory_button.clicked.connect(self.memory_requested.emit)
         self.developer_button.clicked.connect(self.developer_requested.emit)
+        self.update_button.clicked.connect(self.update_requested.emit)
         self.computer_control.toggled.connect(self._publish)
         self.reduced.toggled.connect(self._publish)
 
@@ -845,6 +862,8 @@ class LiquidMainWindow(QMainWindow):
     wake_status_signal = pyqtSignal(object)
     developer_status_signal = pyqtSignal(bool, int)
     developer_password_signal = pyqtSignal(object)
+    update_status_signal = pyqtSignal(str, bool)
+    update_confirmation_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -866,6 +885,7 @@ class LiquidMainWindow(QMainWindow):
         self.on_persona_settings_changed = None
         self.on_developer_activate_requested = None
         self.on_developer_disable_requested = None
+        self.on_update_requested = None
         self._muted = False
         self._current_file: str | None = None
         self._ready = is_configured()
@@ -910,6 +930,7 @@ class LiquidMainWindow(QMainWindow):
         self.settings_panel.history_requested.connect(self.show_history)
         self.settings_panel.memory_requested.connect(self.show_memory)
         self.settings_panel.developer_requested.connect(self.show_developer)
+        self.settings_panel.update_requested.connect(self._request_update)
         self.settings_panel.hide()
         self.root_layout.addWidget(self.settings_panel, 0, Qt.AlignmentFlag.AlignHCenter)
 
@@ -955,6 +976,8 @@ class LiquidMainWindow(QMainWindow):
         self.wake_status_signal.connect(self.settings_panel.set_wake_status)
         self.developer_status_signal.connect(self._apply_developer_status)
         self.developer_password_signal.connect(self._show_developer_password)
+        self.update_status_signal.connect(self._apply_update_status)
+        self.update_confirmation_signal.connect(self._show_update_confirmation)
         self._configure_shortcuts()
         self._apply_visual_settings(self.settings, save=False)
         QTimer.singleShot(0, self._center_on_screen)
@@ -1304,6 +1327,47 @@ class LiquidMainWindow(QMainWindow):
             return None
         return request["result"]
 
+    def _request_update(self) -> None:
+        if not self.on_update_requested:
+            self._apply_update_status("Actualizador no disponible", False)
+            return
+        self._apply_update_status("Buscando actualizaciones…", True)
+        threading.Thread(target=self.on_update_requested, daemon=True).start()
+
+    def _apply_update_status(self, text: str, busy: bool) -> None:
+        self.settings_panel.version_label.setText(str(text))
+        self.settings_panel.update_button.setEnabled(not bool(busy))
+
+    def _show_update_confirmation(self, request: dict) -> None:
+        version = str(request.get("version") or "")
+        notes = str(request.get("notes") or "").strip()
+        detail = f"\n\n{notes[:1200]}" if notes else ""
+        answer = QMessageBox.question(
+            self,
+            "Actualizar Jarvis Windows",
+            (
+                f"Se instalará Jarvis Windows v{version}.\n"
+                "Jarvis se cerrará y volverá a abrir al terminar."
+                f"{detail}\n\n¿Continuar?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        request["result"] = answer == QMessageBox.StandardButton.Yes
+        request["event"].set()
+
+    def confirm_update(self, version: str, notes: str = "") -> bool:
+        request = {
+            "event": threading.Event(),
+            "result": False,
+            "version": str(version),
+            "notes": str(notes),
+        }
+        self.update_confirmation_signal.emit(request)
+        if not request["event"].wait(timeout=300):
+            return False
+        return bool(request["result"])
+
     def _on_shader_failure(self, error: str) -> None:
         self._last_log = f"Renderizador simplificado: {error}"
 
@@ -1501,6 +1565,23 @@ class LiquidJarvisUI:
     @on_developer_disable_requested.setter
     def on_developer_disable_requested(self, callback) -> None:
         self._win.on_developer_disable_requested = callback
+
+    @property
+    def on_update_requested(self):
+        return self._win.on_update_requested
+
+    @on_update_requested.setter
+    def on_update_requested(self, callback) -> None:
+        self._win.on_update_requested = callback
+
+    def set_update_status(self, text: str, busy: bool = False) -> None:
+        try:
+            self._win.update_status_signal.emit(str(text), bool(busy))
+        except RuntimeError:
+            return
+
+    def confirm_update(self, version: str, notes: str = "") -> bool:
+        return self._win.confirm_update(version, notes)
 
     def request_developer_password(self) -> str | None:
         return self._win.request_developer_password()
