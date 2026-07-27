@@ -48,12 +48,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" `
-            dist-installer/Jarvis-Setup.exe `
-            dist-installer/jarvis-windows-manifest.json `
-            dist-installer/SHA256SUMS.txt `
-            --title "Jarvis Windows v$((Get-Content -Raw WINDOWS_VERSION).Trim())" `
-            --notes-file CHANGELOG_WINDOWS.md
+          $tag = "${{ github.ref_name }}"
+          $title = "Jarvis Windows v$((Get-Content -Raw WINDOWS_VERSION).Trim())"
+          $assets = @(
+            "dist-installer/Jarvis-Setup.exe"
+            "dist-installer/jarvis-windows-manifest.json"
+            "dist-installer/SHA256SUMS.txt"
+          )
+          if (gh release view $tag 2>$null) {
+            gh release upload $tag @assets --clobber
+            gh release edit $tag --title $title --notes-file CHANGELOG_WINDOWS.md
+          } else {
+            gh release create $tag @assets --title $title --notes-file CHANGELOG_WINDOWS.md
+          }
 
       - name: Guardar instalador de prueba
         if: github.ref_type != 'tag'
